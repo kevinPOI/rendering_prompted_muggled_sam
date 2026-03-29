@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--object_id",
         type=str,
-        default = "gear",
+        default = "tool_base",
         help="Object name/id to load from the reference directory.",
     )
     parser.add_argument(

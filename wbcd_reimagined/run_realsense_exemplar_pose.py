@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -12,6 +13,10 @@ import numpy as np
 import open3d as o3d
 import pyrealsense2 as rs
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from muggled_sam.make_sam import make_sam_from_state_dict
 
@@ -49,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--finetune_ckpt",
         type=str,
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/model_weights/finetune_epoch_018.pth",
+        default="model_weights/0321_k12_b156_resume_from_preprinte18_s1_e34.pth",
         help="Optional finetuned detector checkpoint.",
     )
     # parser.add_argument(
@@ -86,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--object_id",
         type=str,
-        default="cube",
+        default="bowl",
         help="Object name/id to load from the reference directory (and mesh_dir).",
     )
     parser.add_argument(
@@ -180,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--visualize_icp",
-        default=True,
+        default=False,
         action="store_true",
         help="Show Open3D ICP visualization (blocking).",
     )
@@ -188,6 +193,12 @@ def parse_args() -> argparse.Namespace:
         "--to_base",
         action="store_true",
         help="Transform poses to base frame using the hard-coded extrinsic.",
+    )
+    parser.add_argument(
+        "--rs_timeout_ms",
+        type=int,
+        default=5000,
+        help="Realsense wait_for_frames timeout in milliseconds.",
     )
     return parser.parse_args()
 
@@ -215,6 +226,9 @@ def cam_frame_to_base_frame(object_pose_in_camera: np.ndarray) -> np.ndarray:
 
 class Realsense:
     def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
@@ -236,11 +250,24 @@ class Realsense:
             ]
         )
 
-    def get_frames(self) -> Tuple[np.ndarray, np.ndarray]:
-        frames = self.pipeline.wait_for_frames()
+    def restart(self) -> None:
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+        self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        self.profile = self.pipeline.start(self.config)
+
+    def get_frames(self, timeout_ms: int = 5000) -> Tuple[np.ndarray, np.ndarray]:
+        frames = self.pipeline.wait_for_frames(timeout_ms)
         aligned_frames = self.align.process(frames)
         aligned_depth_frame = aligned_frames.get_depth_frame()
         color_frame = aligned_frames.get_color_frame()
+        if not aligned_depth_frame or not color_frame:
+            raise RuntimeError("Realsense returned invalid frames (depth/color missing).")
         depth_image = np.asanyarray(aligned_depth_frame.get_data())
         depth_image = (depth_image.astype(np.float32) * self.depth_scale / 0.001).astype(int)
         color_image = np.asanyarray(color_frame.get_data())
@@ -308,13 +335,20 @@ def icp_get_6d_pose(
             transformation @ _rot_x(-np.pi / 2),
         ]
 
-    pc_center = np.mean(np.asarray(cam_pc.points), axis=0).reshape((3, 1))
+    # Use bounding-box center for alignment instead of centroid.
+    cam_pts = np.asarray(cam_pc.points)
+    cam_min = np.min(cam_pts, axis=0)
+    cam_max = np.max(cam_pts, axis=0)
+    pc_center = ((cam_min + cam_max) / 2.0).reshape((3, 1))
     min_rmse = float("inf")
     best_trans = None
 
     for trans_init in init_transformations:
         ref_pc = copy.deepcopy(cad_pc)
-        ref_pc_center = np.mean(np.asarray(ref_pc.points), axis=0).reshape((3, 1))
+        ref_pts = np.asarray(ref_pc.points)
+        ref_min = np.min(ref_pts, axis=0)
+        ref_max = np.max(ref_pts, axis=0)
+        ref_pc_center = ((ref_min + ref_max) / 2.0).reshape((3, 1))
         t_init = np.identity(4)
         t_init[:3, 3] = -(ref_pc_center - pc_center)[:, 0]
         t_init = t_init @ trans_init
@@ -469,55 +503,179 @@ def _resolve_mesh_path(mesh_dir: Path, mesh_path: str, object_id: str) -> Path:
     raise FileNotFoundError(f"No mesh found for object_id={object_id} in {mesh_dir}")
 
 
+class ExemplarPosePipeline:
+    def __init__(
+        self,
+        model_path: str,
+        finetune_ckpt: str,
+        reference_dir: str,
+        mesh_dir: str,
+        mesh_path: str,
+        object_id: str,
+        ref_view_ids: str,
+        max_side_length: int = 1008,
+        no_square: bool = False,
+        num_points_approx: int = 24,
+        device: str = "cuda:0",
+        dtype: str = "",
+        det_filter: float = 0.0,
+        nms_iou: float = 0.5,
+        max_objects: int = 2,
+        grayscale: bool = False,
+        visualize_icp: bool = False,
+        to_base: bool = False,
+    ) -> None:
+        self.device = torch.device(device if device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        if dtype:
+            self.dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+        else:
+            self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+
+        self.max_side_length = max_side_length
+        self.no_square = no_square
+        self.num_points_approx = num_points_approx
+        self.det_filter = det_filter
+        self.nms_iou = nms_iou
+        self.max_objects = max_objects
+        self.grayscale = grayscale
+        self.visualize_icp = visualize_icp
+        self.to_base = to_base
+
+        reference_dir_path = Path(reference_dir).expanduser().resolve()
+        if not reference_dir_path.is_dir():
+            raise FileNotFoundError(reference_dir_path)
+
+        mesh_dir_path = Path(mesh_dir).expanduser().resolve()
+        mesh_path_resolved = _resolve_mesh_path(mesh_dir_path, mesh_path, object_id)
+        self.mesh = o3d.io.read_triangle_mesh(str(mesh_path_resolved))
+        if self.mesh.is_empty() or not self.mesh.has_triangles():
+            raise ValueError(f"Mesh invalid or empty: {mesh_path_resolved}")
+
+        view_ids = parse_ref_view_ids(ref_view_ids)
+        if not view_ids:
+            raise ValueError("No reference view ids resolved.")
+
+        _, base_model = make_sam_from_state_dict(model_path)
+        base_model.to(device=self.device, dtype=self.dtype)
+        self.detmodel = base_model.make_detector_model()
+        self.detmodel.to(device=self.device, dtype=self.dtype)
+        self.detmodel.eval()
+
+        if finetune_ckpt:
+            ckpt = torch.load(finetune_ckpt, map_location="cpu")
+            self.detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
+            self.detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
+            self.detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
+            print("Loaded finetuned detector weights from", finetune_ckpt)
+
+        self.exemplar_ref = build_exemplar_tokens_for_object(
+            detmodel=self.detmodel,
+            object_id=object_id,
+            reference_dir=reference_dir_path,
+            ref_view_ids=view_ids,
+            max_side_length=max_side_length,
+            use_square_sizing=not no_square,
+            num_points_approx=num_points_approx,
+            device=self.device,
+            grayscale=grayscale,
+        )
+        if self.exemplar_ref is None:
+            raise RuntimeError("No exemplar tokens built. Check reference_dir/object_id/ref_view_ids.")
+
+    def process_frame(
+        self,
+        frame_bgr: np.ndarray,
+        depth_image: np.ndarray,
+        K: np.ndarray,
+        alpha: float = 0.45,
+        max_show: int = 3,
+        draw_overlays: bool = False,
+    ) -> Tuple[List[Optional[np.ndarray]], torch.Tensor, torch.Tensor, Optional[np.ndarray]]:
+        if self.grayscale:
+            frame_bgr = apply_grayscale(frame_bgr)
+
+        with torch.inference_mode():
+            img_t = self.detmodel.image_encoder.prepare_image(
+                frame_bgr,
+                max_side_length=self.max_side_length,
+                use_square_sizing=not self.no_square,
+            )
+            encoded_img = self.detmodel.image_encoder(img_t)
+            encoded_image_features_list = self.detmodel.image_projection.v3_projection(encoded_img)
+
+            exemplar_batch, padding_mask = pad_exemplar_batch([self.exemplar_ref], device=self.device)
+            mask_preds, box_preds, det_scores, _ = generate_detections_train(
+                self.detmodel,
+                encoded_image_features_list,
+                exemplar_batch,
+                detection_filter_threshold=self.det_filter,
+                exemplar_padding_mask_bn=padding_mask,
+            )
+
+            masks_nhw = mask_preds[0]
+            scores_n = det_scores[0]
+            if masks_nhw.shape[0] > 0 and self.nms_iou > 0:
+                _, masks_nhw, scores_n = apply_mask_nms(
+                    box_preds[0], masks_nhw, scores_n, iou_threshold=self.nms_iou
+                )
+
+        poses: List[Optional[np.ndarray]] = []
+        if masks_nhw.shape[0] > 0:
+            h, w = frame_bgr.shape[:2]
+            for i in range(min(self.max_objects, masks_nhw.shape[0])):
+                mask = masks_nhw[i].detach().float().cpu().numpy() > 0
+                mask_resized = cv2.resize(
+                    mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+                pose = get_pose_from_mask(
+                    mask_resized.astype(np.uint8),
+                    depth_image,
+                    K,
+                    self.mesh,
+                    visualize=self.visualize_icp,
+                )
+                if pose is not None and self.to_base:
+                    pose = cam_frame_to_base_frame(pose)
+                poses.append(pose)
+
+        vis = None
+        if draw_overlays:
+            vis = _draw_overlays(
+                frame_bgr,
+                masks_nhw,
+                scores_n,
+                poses,
+                alpha=alpha,
+                max_show=max_show,
+            )
+        return poses, masks_nhw, scores_n, vis
+
+
 def main() -> None:
     args = parse_args()
 
-    device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    if args.dtype:
-        dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    else:
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-
-    reference_dir = Path(args.reference_dir).expanduser().resolve()
-    if not reference_dir.is_dir():
-        raise FileNotFoundError(reference_dir)
-
-    mesh_dir = Path(args.mesh_dir).expanduser().resolve()
-    mesh_path = _resolve_mesh_path(mesh_dir, args.mesh_path, args.object_id)
-    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
-    if mesh.is_empty() or not mesh.has_triangles():
-        raise ValueError(f"Mesh invalid or empty: {mesh_path}")
-
-    ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
-    if not ref_view_ids:
-        raise ValueError("No reference view ids resolved.")
-
-    _, base_model = make_sam_from_state_dict(args.model_path)
-    base_model.to(device=device, dtype=dtype)
-    detmodel = base_model.make_detector_model()
-    detmodel.to(device=device, dtype=dtype)
-    detmodel.eval()
-
-    if args.finetune_ckpt:
-        ckpt = torch.load(args.finetune_ckpt, map_location="cpu")
-        detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
-        detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
-        detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
-        print("Loaded finetuned detector weights from", args.finetune_ckpt)
-
-    exemplar_ref = build_exemplar_tokens_for_object(
-        detmodel=detmodel,
+    pipeline = ExemplarPosePipeline(
+        model_path=args.model_path,
+        finetune_ckpt=args.finetune_ckpt,
+        reference_dir=args.reference_dir,
+        mesh_dir=args.mesh_dir,
+        mesh_path=args.mesh_path,
         object_id=args.object_id,
-        reference_dir=reference_dir,
-        ref_view_ids=ref_view_ids,
+        ref_view_ids=args.ref_view_ids,
         max_side_length=args.max_side_length,
-        use_square_sizing=not args.no_square,
+        no_square=args.no_square,
         num_points_approx=args.num_points_approx,
-        device=device,
+        device=args.device,
+        dtype=args.dtype,
+        det_filter=args.det_filter,
+        nms_iou=args.nms_iou,
+        max_objects=args.max_objects,
         grayscale=args.grayscale,
+        visualize_icp=args.visualize_icp,
+        to_base=args.to_base,
     )
-    if exemplar_ref is None:
-        raise RuntimeError("No exemplar tokens built. Check reference_dir/object_id/ref_view_ids.")
 
     realsense = Realsense(width=args.width, height=args.height, fps=args.fps)
 
@@ -525,82 +683,45 @@ def main() -> None:
     fps_ema: Optional[float] = None
 
     try:
-        with torch.inference_mode():
-            while True:
-                frame_bgr, depth_image = realsense.get_frames()
-                if args.grayscale:
-                    frame_bgr = apply_grayscale(frame_bgr)
+        while True:
+            try:
+                frame_bgr, depth_image = realsense.get_frames(timeout_ms=args.rs_timeout_ms)
+                print("Got frames from RealSense.")
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "Frame didn't arrive" in msg or "invalid frames" in msg:
+                    print(f"[realsense] {msg} (timeout_ms={args.rs_timeout_ms}); restarting pipeline...")
+                    realsense.restart()
+                    continue
+                raise
 
-                img_t = detmodel.image_encoder.prepare_image(
-                    frame_bgr,
-                    max_side_length=args.max_side_length,
-                    use_square_sizing=not args.no_square,
-                )
-                encoded_img = detmodel.image_encoder(img_t)
-                encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
+            poses, masks_nhw, scores_n, vis = pipeline.process_frame(
+                frame_bgr,
+                depth_image,
+                realsense.K,
+                alpha=args.alpha,
+                max_show=args.max_show,
+                draw_overlays=True,
+            )
 
-                exemplar_batch, padding_mask = pad_exemplar_batch([exemplar_ref], device=device)
-                mask_preds, box_preds, det_scores, _ = generate_detections_train(
-                    detmodel,
-                    encoded_image_features_list,
-                    exemplar_batch,
-                    detection_filter_threshold=args.det_filter,
-                    exemplar_padding_mask_bn=padding_mask,
-                )
-
-                masks_nhw = mask_preds[0]
-                scores_n = det_scores[0]
-                if masks_nhw.shape[0] > 0 and args.nms_iou > 0:
-                    _, masks_nhw, scores_n = apply_mask_nms(
-                        box_preds[0], masks_nhw, scores_n, iou_threshold=args.nms_iou
-                    )
-
-                poses: List[Optional[np.ndarray]] = []
-                if masks_nhw.shape[0] > 0:
-                    h, w = frame_bgr.shape[:2]
-                    for i in range(min(args.max_objects, masks_nhw.shape[0])):
-                        mask = masks_nhw[i].detach().float().cpu().numpy() > 0
-                        mask_resized = cv2.resize(
-                            mask.astype(np.uint8),
-                            (w, h),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                        pose = get_pose_from_mask(
-                            mask_resized.astype(np.uint8),
-                            depth_image,
-                            realsense.K,
-                            mesh,
-                            visualize=args.visualize_icp,
-                        )
-                        if pose is not None and args.to_base:
-                            pose = cam_frame_to_base_frame(pose)
-                        poses.append(pose)
-                vis = _draw_overlays(
-                    frame_bgr,
-                    masks_nhw,
-                    scores_n,
-                    poses,
-                    alpha=args.alpha,
-                    max_show=args.max_show,
+            now = time.time()
+            dt = now - last_time
+            last_time = now
+            if dt > 0:
+                fps = 1.0 / dt
+                fps_ema = fps if fps_ema is None else fps_ema * 0.9 + fps * 0.1
+            if fps_ema is not None and vis is not None:
+                cv2.putText(
+                    vis,
+                    f"FPS: {fps_ema:.1f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
                 )
 
-                now = time.time()
-                dt = now - last_time
-                last_time = now
-                if dt > 0:
-                    fps = 1.0 / dt
-                    fps_ema = fps if fps_ema is None else fps_ema * 0.9 + fps * 0.1
-                if fps_ema is not None:
-                    cv2.putText(
-                        vis,
-                        f"FPS: {fps_ema:.1f}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (255, 255, 255),
-                        2,
-                    )
-
+            if vis is not None:
                 cv2.imshow("Exemplar RealSense 6D Pose", vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):

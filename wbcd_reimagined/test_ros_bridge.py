@@ -18,3 +18,4 @@ while True:
         continue
     conn.sendall((s + '\n').encode())
     # 0.3 0.25 0.25 180.0 45.0 90.0 0.0
+    # 0.3 0.15 0.2 180.0 0.0 90.0 0.0

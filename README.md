@@ -1,3 +1,22 @@
+# CAD Prompted SAM3
+
+This repo builds on MuggledSAM, which reimplements SAM3 with better modularity.
+Install the packages in `requirements.txt`, and run all scripts (except the Blender renderer) from the repo root: `rendering_prompted_muggled_sam/`.
+
+Quick tasks:
+1. Sample eval on the 3D‑printing dataset. Segmentation results will be outputed to outputs_eval_exemplar/
+   ```bash
+   python eval_image_exemplar.py
+   ```
+1. Generate a rendering template from an STL (Blender 5.0 required). From the Blender root folder:
+   ```bash
+   ./blender -b -P path/to/rendering_prompted_muggled_sam/blender_renderer.py
+   ```
+1. Realtime webcam inference: set the object reference dir and object name in `run_webcam_exemplar.py`, then run:
+   ```bash
+   python run_webcam_exemplar.py
+   ```
+
 # MuggledSAM
 
 This repo contains a simplified implementation of the awesome 'Segment Anything' models from [facebookresearch](https://ai.meta.com/research/#projects) ([SAM1](https://github.com/facebookresearch/segment-anything), [SAM2](https://github.com/facebookresearch/sam2) & [SAM3](https://github.com/facebookresearch/sam3)), with the intention of [removing the magic](https://en.wikipedia.org/wiki/Muggle) from the original code base to make it easier to understand.
