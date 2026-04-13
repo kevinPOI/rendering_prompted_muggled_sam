@@ -12,6 +12,7 @@ class GraspSpec:
     z_offset: float
     gripper_close_pos: float
     use_object_yaw: bool
+    use_convex_hull: bool = False
 
 
 class GraspMethods:
@@ -28,7 +29,7 @@ class GraspMethods:
     def get_spec(self, object_id: str) -> GraspSpec:
         return self._specs.get(
             object_id,
-            GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.02, use_object_yaw=False),
+            GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.02, use_object_yaw=False, use_convex_hull=False),
         )
 
     def register(self, object_id: str, spec: GraspSpec) -> None:

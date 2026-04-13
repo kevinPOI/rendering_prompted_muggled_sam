@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--finetune_ckpt",
         type=str,
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/model_weights/finetune_epoch_018.pth",
+        default="/home/kevin/ICL/rendering_prompted_muggled_sam/model_weights/0321_k12_b156_resume_from_preprinte18_s1_e34.pth",
         help="Optional finetuned detector checkpoint.",
     )
     parser.add_argument(
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--object_id",
         type=str,
-        default = "tool_base",
+        default = "lego_brick",
         help="Object name/id to load from the reference directory.",
     )
     parser.add_argument(

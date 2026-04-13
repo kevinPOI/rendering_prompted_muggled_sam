@@ -17,6 +17,13 @@ Quick tasks:
    python run_webcam_exemplar.py
    ```
 
+## Pretrained Weights
+
+Pretrained checkpoints are included in the export zip under `model_weights/`.
+
+- `preprint_e18.pth`: Best detection IoU. Recommended when you care about a single class of interest or need better separation between adjacent instances of the same object.
+- `0321_k12_b156_resume_from_preprinte18_s1_e34.pth`: More consistent detection scores across multiple classes for better thresholding, has higher PQ and mAP. Recommended for multi-class detection.
+
 # MuggledSAM
 
 This repo contains a simplified implementation of the awesome 'Segment Anything' models from [facebookresearch](https://ai.meta.com/research/#projects) ([SAM1](https://github.com/facebookresearch/segment-anything), [SAM2](https://github.com/facebookresearch/sam2) & [SAM3](https://github.com/facebookresearch/sam3)), with the intention of [removing the magic](https://en.wikipedia.org/wiki/Muggle) from the original code base to make it easier to understand.

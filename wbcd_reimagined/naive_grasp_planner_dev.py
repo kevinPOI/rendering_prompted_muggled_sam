@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -42,7 +41,6 @@ class PlannerParams:
     normal_dot_threshold: float = -0.3
     min_width: float = 0.0
     z_band_ratio: float = 0.01
-    use_convex_hull: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,30 +63,10 @@ def _normalize(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     return v / n
 
 
-def _sampling_mesh(
-    mesh: o3d.geometry.TriangleMesh,
-    use_convex_hull: bool = False,
-) -> o3d.geometry.TriangleMesh:
-    if not use_convex_hull:
-        sampling_mesh = mesh
-    else:
-        hull_result = mesh.compute_convex_hull()
-        sampling_mesh = hull_result[0] if isinstance(hull_result, tuple) else hull_result
-    sampling_mesh = o3d.geometry.TriangleMesh(sampling_mesh)
-    sampling_mesh.compute_triangle_normals()
-    sampling_mesh.compute_vertex_normals()
-    return sampling_mesh
-
-
-def sample_surface_points(
-    mesh: o3d.geometry.TriangleMesh,
-    num_points: int,
-    seed: int = 0,
-    use_convex_hull: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+def sample_surface_points(mesh: o3d.geometry.TriangleMesh, num_points: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     _ = seed
-    sampling_mesh = _sampling_mesh(mesh, use_convex_hull=use_convex_hull)
-    pcd = sampling_mesh.sample_points_uniformly(number_of_points=num_points)
+    mesh.compute_vertex_normals()
+    pcd = mesh.sample_points_uniformly(number_of_points=num_points)
     points = np.asarray(pcd.points, dtype=np.float64)
     normals = np.asarray(pcd.normals, dtype=np.float64)
     return points, normals
@@ -189,15 +167,10 @@ def plan_grasps(
     seed: int = 0,
     z_center: float = 0.0,
 ) -> list[GraspCandidate]:
-    points, normals = sample_surface_points(
-        mesh,
-        planner.num_surface_points,
-        seed=seed,
-        use_convex_hull=planner.use_convex_hull,
-    )
+    points, normals = sample_surface_points(mesh, planner.num_surface_points, seed=seed)
     aabb = mesh.get_axis_aligned_bounding_box()
     z_min, z_max = float(aabb.min_bound[2]), float(aabb.max_bound[2])
-    z_mid = float(z_min + 0.4 * (z_max - z_min))
+    z_mid = float(z_min + 0.35 * (z_max - z_min))
     z_band = planner.z_band_ratio * (z_max - z_min)
     band_mask = np.abs(points[:, 2] - z_mid) <= z_band
     points = points[band_mask]
@@ -365,13 +338,7 @@ def _normal_arrow(center: np.ndarray, normal: np.ndarray, length: float) -> o3d.
     return arrow
 
 
-def demo(
-    mesh_path: str,
-    top_k: int = 2,
-    seed: int = 0,
-    rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    use_convex_hull: bool = False,
-) -> Optional[np.ndarray]:
+def demo(mesh_path: str, top_k: int = 2, seed: int = 0) -> Optional[np.ndarray]:
     mesh = o3d.io.read_triangle_mesh(mesh_path)
     if mesh.is_empty():
         raise ValueError("Loaded mesh is empty or invalid.")
@@ -389,10 +356,9 @@ def demo(
         bbox_size = aabb.get_extent()
     bbox_center = aabb.get_center()
     mesh.translate(-bbox_center)
-    if any(abs(float(v)) > 1e-6 for v in rpy_deg):
-        rpy_rad = np.deg2rad([rpy_deg[0], rpy_deg[1], rpy_deg[2]])
-        rot = o3d.geometry.get_rotation_matrix_from_xyz(rpy_rad)
-        mesh.rotate(rot, center=[0.0, 0.0, 0.0])
+    rpy_rad = np.deg2rad([80.0, 5.0, 17.0])
+    rot = o3d.geometry.get_rotation_matrix_from_xyz(rpy_rad)
+    mesh.rotate(rot, center=[0.0, 0.0, 0.0])
     aabb = mesh.get_axis_aligned_bounding_box()
     bbox_size = aabb.get_extent()
     z_center = 0.0
@@ -410,30 +376,22 @@ def demo(
         palm_depth=0.01,
         palm_height=0.01,
     )
-    planner = PlannerParams(use_convex_hull=use_convex_hull)
+    planner = PlannerParams()
 
-    t_grasp_calc_start = time.perf_counter()
-    points, normals = sample_surface_points(
-        mesh,
-        planner.num_surface_points,
-        seed=seed,
-        use_convex_hull=planner.use_convex_hull,
-    )
+    points, normals = sample_surface_points(mesh, planner.num_surface_points, seed=seed)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.normals = o3d.utility.Vector3dVector(normals)
     colors = 0.5 * (normals + 1.0)
     colors = np.clip(colors, 0.0, 1.0)
     pcd.colors = o3d.utility.Vector3dVector(colors)
-    # o3d.visualization.draw([{"name": "pcd", "geometry": pcd}], title="Sampled Point Cloud")
+    o3d.visualization.draw([{"name": "pcd", "geometry": pcd}], title="Sampled Point Cloud")
 
     grasps = plan_grasps(mesh, gripper, planner, top_k=top_k, seed=seed, z_center=z_center)
     if not grasps:
         print("No grasps found.")
         return None
     print(f"Found {len(grasps)} grasps. Best score: {grasps[0].score:.3f}")
-    grasp_calc_time_s = time.perf_counter() - t_grasp_calc_start
-    print(f"Grasp calculation time: {grasp_calc_time_s * 1000.0:.1f} ms")
 
     axis_len = 0.6 * float(np.max(bbox_size))
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_len, origin=[0.0, 0.0, 0.0])
@@ -525,19 +483,13 @@ def main() -> None:
         default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/mesh_0316",
     )
     parser.add_argument("--mesh_path", type=str, default="")
-    parser.add_argument("--object_id", type=str, default="lego_brick")
+    parser.add_argument("--object_id", type=str, default="rod_stand")
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--use_convex_hull",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="If true, sample grasp contacts on the mesh convex hull instead of the raw mesh surface.",
-    )
     args = parser.parse_args()
     mesh_path = args.mesh if args.mesh else args.mesh_path
     mesh_path = _resolve_mesh_path(args.mesh_dir, mesh_path, args.object_id)
-    demo(mesh_path, args.top_k, args.seed, use_convex_hull=args.use_convex_hull)
+    demo(mesh_path, args.top_k, args.seed)
 
 
 if __name__ == "__main__":

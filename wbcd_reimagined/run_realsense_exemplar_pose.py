@@ -6,7 +6,7 @@ import copy
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -57,31 +57,31 @@ def parse_args() -> argparse.Namespace:
         default="model_weights/0321_k12_b156_resume_from_preprinte18_s1_e34.pth",
         help="Optional finetuned detector checkpoint.",
     )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/renders_2442_0316",
-    #     type=str,
-    #     help="Directory containing reference images and masks.",
-    # )
     parser.add_argument(
         "--reference_dir",
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/wbcd_renders_2442_0316",
+        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/renders_2442_0316",
         type=str,
         help="Directory containing reference images and masks.",
     )
-    
     # parser.add_argument(
-    #     "--mesh_dir",
-    #     default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/mesh_0316",
+    #     "--reference_dir",
+    #     default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/wbcd_renders_2442_0316",
     #     type=str,
-    #     help="Directory containing meshes (.stl/.ply/.obj).",
+    #     help="Directory containing reference images and masks.",
     # )
+    
     parser.add_argument(
         "--mesh_dir",
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/wbcd_meshes",
+        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/mesh_0316",
         type=str,
         help="Directory containing meshes (.stl/.ply/.obj).",
     )
+    # parser.add_argument(
+    #     "--mesh_dir",
+    #     default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/wbcd_meshes",
+    #     type=str,
+    #     help="Directory containing meshes (.stl/.ply/.obj).",
+    # )
     parser.add_argument(
         "--mesh_path",
         type=str,
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--object_id",
         type=str,
-        default="bowl",
+        default="gear",
         help="Object name/id to load from the reference directory (and mesh_dir).",
     )
     parser.add_argument(
@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--visualize_icp",
-        default=False,
+        default=True,
         action="store_true",
         help="Show Open3D ICP visualization (blocking).",
     )
@@ -222,6 +222,39 @@ def cam_frame_to_base_frame(object_pose_in_camera: np.ndarray) -> np.ndarray:
     if pos_only:
         object_pos_in_base_hom[:3, :3] = np.eye(3)
     return object_pos_in_base_hom
+
+
+def resolve_torch_device_dtype(device: str = "", dtype: str = "") -> tuple[torch.device, torch.dtype]:
+    torch_device = torch.device(device if device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    if dtype:
+        torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+    else:
+        torch_dtype = torch.bfloat16 if torch_device.type == "cuda" else torch.float32
+    return torch_device, torch_dtype
+
+
+def load_detector_model(
+    model_path: str,
+    finetune_ckpt: str,
+    device: str = "",
+    dtype: str = "",
+) -> tuple[torch.nn.Module, torch.device, torch.dtype]:
+    torch_device, torch_dtype = resolve_torch_device_dtype(device=device, dtype=dtype)
+
+    _, base_model = make_sam_from_state_dict(model_path)
+    base_model.to(device=torch_device, dtype=torch_dtype)
+    detmodel = base_model.make_detector_model()
+    detmodel.to(device=torch_device, dtype=torch_dtype)
+    detmodel.eval()
+
+    if finetune_ckpt:
+        ckpt = torch.load(finetune_ckpt, map_location="cpu")
+        detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
+        detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
+        detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
+        print("Loaded finetuned detector weights from", finetune_ckpt)
+
+    return detmodel, torch_device, torch_dtype
 
 
 class Realsense:
@@ -445,14 +478,36 @@ def _draw_overlays(
     poses: List[Optional[np.ndarray]],
     alpha: float,
     max_show: int,
+    object_id: str = "",
 ) -> np.ndarray:
     out = frame_bgr.copy()
     h, w = out.shape[:2]
+    if object_id:
+        cv2.putText(
+            out,
+            object_id,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 0),
+            4,
+        )
+        cv2.putText(
+            out,
+            object_id,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
     if masks_nhw.shape[0] == 0:
         return out
     num_show = min(max_show, masks_nhw.shape[0])
     masks_cpu = masks_nhw[:num_show].detach().float().cpu().numpy()
     scores_cpu = scores_n[:num_show].detach().float().cpu().numpy()
+    sorted_idx = np.argsort(scores_cpu)[::-1]
+    rank_by_idx = {int(idx): rank for rank, idx in enumerate(sorted_idx)}
 
     for i in range(num_show):
         mask = masks_cpu[i] > 0
@@ -466,25 +521,46 @@ def _draw_overlays(
         color = PALETTE_BGR[i % len(PALETTE_BGR)]
         overlay = out.copy()
         overlay[mask_resized] = color
-        out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+        rank = rank_by_idx.get(i, i)
+        if rank == 0:
+            alpha_i = alpha
+        elif rank == 1:
+            alpha_i = alpha * 0.25
+        else:
+            alpha_i = alpha * 0.25
+        out = cv2.addWeighted(overlay, alpha_i, out, 1 - alpha_i, 0)
         bbox = _mask_bbox(mask_resized.astype(np.uint8))
         if bbox is not None:
             x0, y0, x1, y1 = bbox
-            cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
             score_val = float(scores_cpu[i]) if i < scores_cpu.size else 0.0
             label = f"{score_val:.2f}"
             if i < len(poses) and poses[i] is not None:
                 t = poses[i][:3, 3]
                 label = f"{score_val:.2f} ({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})m"
-            cv2.putText(
-                out,
-                label,
-                (x0, max(0, y0 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
+            if rank == 0:
+                cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
+                cv2.putText(
+                    out,
+                    label,
+                    (x0, max(0, y0 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+            else:
+                anno = out.copy()
+                cv2.rectangle(anno, (x0, y0), (x1, y1), color, 2)
+                cv2.putText(
+                    anno,
+                    label,
+                    (x0, max(0, y0 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+                out = cv2.addWeighted(anno, 0.3, out, 0.7, 0)
     return out
 
 
@@ -524,13 +600,11 @@ class ExemplarPosePipeline:
         grayscale: bool = False,
         visualize_icp: bool = False,
         to_base: bool = False,
+        detmodel: Optional[torch.nn.Module] = None,
     ) -> None:
-        self.device = torch.device(device if device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
-        if dtype:
-            self.dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
-        else:
-            self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.device, self.dtype = resolve_torch_device_dtype(device=device, dtype=dtype)
 
+        self.object_id = object_id
         self.max_side_length = max_side_length
         self.no_square = no_square
         self.num_points_approx = num_points_approx
@@ -555,18 +629,15 @@ class ExemplarPosePipeline:
         if not view_ids:
             raise ValueError("No reference view ids resolved.")
 
-        _, base_model = make_sam_from_state_dict(model_path)
-        base_model.to(device=self.device, dtype=self.dtype)
-        self.detmodel = base_model.make_detector_model()
-        self.detmodel.to(device=self.device, dtype=self.dtype)
-        self.detmodel.eval()
-
-        if finetune_ckpt:
-            ckpt = torch.load(finetune_ckpt, map_location="cpu")
-            self.detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
-            self.detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
-            self.detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
-            print("Loaded finetuned detector weights from", finetune_ckpt)
+        if detmodel is None:
+            self.detmodel, _, _ = load_detector_model(
+                model_path=model_path,
+                finetune_ckpt=finetune_ckpt,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            self.detmodel = detmodel
 
         self.exemplar_ref = build_exemplar_tokens_for_object(
             detmodel=self.detmodel,
@@ -590,11 +661,18 @@ class ExemplarPosePipeline:
         alpha: float = 0.45,
         max_show: int = 3,
         draw_overlays: bool = False,
-    ) -> Tuple[List[Optional[np.ndarray]], torch.Tensor, torch.Tensor, Optional[np.ndarray]]:
+        run_icp: bool = True,
+        return_timings: bool = False,
+    ) -> (
+        Tuple[List[Optional[np.ndarray]], torch.Tensor, torch.Tensor, Optional[np.ndarray]]
+        | Tuple[List[Optional[np.ndarray]], torch.Tensor, torch.Tensor, Optional[np.ndarray], Dict[str, float]]
+    ):
+        timings: Dict[str, float] = {}
         if self.grayscale:
             frame_bgr = apply_grayscale(frame_bgr)
 
         with torch.inference_mode():
+            t_encode_start = time.perf_counter()
             img_t = self.detmodel.image_encoder.prepare_image(
                 frame_bgr,
                 max_side_length=self.max_side_length,
@@ -602,8 +680,10 @@ class ExemplarPosePipeline:
             )
             encoded_img = self.detmodel.image_encoder(img_t)
             encoded_image_features_list = self.detmodel.image_projection.v3_projection(encoded_img)
+            timings["encode_image_s"] = time.perf_counter() - t_encode_start
 
             exemplar_batch, padding_mask = pad_exemplar_batch([self.exemplar_ref], device=self.device)
+            t_detect_start = time.perf_counter()
             mask_preds, box_preds, det_scores, _ = generate_detections_train(
                 self.detmodel,
                 encoded_image_features_list,
@@ -611,6 +691,7 @@ class ExemplarPosePipeline:
                 detection_filter_threshold=self.det_filter,
                 exemplar_padding_mask_bn=padding_mask,
             )
+            timings["detect_s"] = time.perf_counter() - t_detect_start
 
             masks_nhw = mask_preds[0]
             scores_n = det_scores[0]
@@ -620,15 +701,21 @@ class ExemplarPosePipeline:
                 )
 
         poses: List[Optional[np.ndarray]] = []
-        if masks_nhw.shape[0] > 0:
+        icp_total_s = 0.0
+        if masks_nhw.shape[0] > 0 and run_icp:
             h, w = frame_bgr.shape[:2]
-            for i in range(min(self.max_objects, masks_nhw.shape[0])):
+            if self.visualize_icp:
+                idxs = [int(torch.argmax(scores_n).item())]
+            else:
+                idxs = list(range(min(self.max_objects, masks_nhw.shape[0])))
+            for i in idxs:
                 mask = masks_nhw[i].detach().float().cpu().numpy() > 0
                 mask_resized = cv2.resize(
                     mask.astype(np.uint8),
                     (w, h),
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
+                t_icp_start = time.perf_counter()
                 pose = get_pose_from_mask(
                     mask_resized.astype(np.uint8),
                     depth_image,
@@ -636,9 +723,14 @@ class ExemplarPosePipeline:
                     self.mesh,
                     visualize=self.visualize_icp,
                 )
+                icp_total_s += time.perf_counter() - t_icp_start
                 if pose is not None and self.to_base:
                     pose = cam_frame_to_base_frame(pose)
                 poses.append(pose)
+        elif masks_nhw.shape[0] > 0:
+            num_show = min(self.max_objects, masks_nhw.shape[0])
+            poses = [None for _ in range(num_show)]
+        timings["icp_s"] = icp_total_s
 
         vis = None
         if draw_overlays:
@@ -649,7 +741,10 @@ class ExemplarPosePipeline:
                 poses,
                 alpha=alpha,
                 max_show=max_show,
+                object_id=self.object_id,
             )
+        if return_timings:
+            return poses, masks_nhw, scores_n, vis, timings
         return poses, masks_nhw, scores_n, vis
 
 
