@@ -26,6 +26,7 @@ from wbcd_reimagined.naive_grasp_planner import (
     PlannerParams,
     _transparent_material,
     _transparent_material_color,
+    apply_temporary_display_transform,
     demo as naive_grasp_demo,
     plan_grasps,
 )
@@ -49,7 +50,7 @@ GRASP_METHODS = GraspMethods()
 GRASP_METHODS.register("bowl", GraspSpec(0.0, -0.05, 0.0, gripper_close_pos=0.98, use_object_yaw=False, use_convex_hull=False))
 GRASP_METHODS.register("cube", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.6, use_object_yaw=True, use_convex_hull=False))
 GRASP_METHODS.register("gear", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.6, use_object_yaw=True, use_convex_hull=False))
-GRASP_METHODS.register("rod_stand", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=False))
+GRASP_METHODS.register("rod_mount", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=False))
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/mesh_0316",
     )
     parser.add_argument("--mesh_path", type=str, default="")
-    parser.add_argument("--object_id", type=str, default="rod_stand")
+    parser.add_argument("--object_id", type=str, default="gear")
     parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true")
@@ -177,7 +178,12 @@ def _visualize_planning_plane(mesh: o3d.geometry.TriangleMesh, z_center: float) 
         },
         {"name": "axis", "geometry": axis},
     ]
-    o3d.visualization.draw(geometries, title="Naive Grasp Planner")
+    draw_geometries = [
+        geom["geometry"] if isinstance(geom, dict) else geom
+        for geom in geometries
+    ]
+    draw_geometries = apply_temporary_display_transform(draw_geometries)
+    o3d.visualization.draw_geometries(draw_geometries, window_name="Naive Grasp Planner")
 
 
 def _plan_grasp_pose_naive(

@@ -40,6 +40,12 @@ PALETTE_BGR: List[Tuple[int, int, int]] = [
     (255, 0, 180),
 ]
 
+ICP_VIEW_ZOOM = 0.4459
+ICP_VIEW_FRONT = [0.9288, -0.2951, -0.2242]
+ICP_VIEW_LOOKAT = [1.6784, 2.0612, 1.4451]
+ICP_VIEW_UP = [-0.3402, -0.9189, -0.1996]
+VIS_FRAME_FLIP_Y = np.diag([1.0, -1.0, 1.0, 1.0])
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -425,16 +431,16 @@ def get_pointcloud_from_mask(mask: np.ndarray, depth_image: np.ndarray, K: np.nd
     return pointcloud
 
 
-def get_pose_from_mask(
+def get_pose_and_pointcloud_from_mask(
     mask: np.ndarray,
     depth_image: np.ndarray,
     K: np.ndarray,
     mesh: o3d.geometry.TriangleMesh,
     visualize: bool,
-) -> Optional[np.ndarray]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     pointcloud = get_pointcloud_from_mask(mask, depth_image, K)
     if pointcloud is None or pointcloud.size == 0:
-        return None
+        return None, None
     ref_pc = mesh.sample_points_uniformly(number_of_points=2000)
     ref_arr = np.asarray(ref_pc.points)
     if np.max(ref_arr[:, 0]) - np.min(ref_arr[:, 0]) <= 1:
@@ -446,6 +452,17 @@ def get_pose_from_mask(
     pose_m[:3, 3] = pose[:3, 3] / 1000.0
     if visualize:
         _draw_registration_result(ref_pc, cam_pc, pose)
+    return pose_m, pointcloud
+
+
+def get_pose_from_mask(
+    mask: np.ndarray,
+    depth_image: np.ndarray,
+    K: np.ndarray,
+    mesh: o3d.geometry.TriangleMesh,
+    visualize: bool,
+) -> Optional[np.ndarray]:
+    pose_m, _ = get_pose_and_pointcloud_from_mask(mask, depth_image, K, mesh, visualize)
     return pose_m
 
 
@@ -459,16 +476,102 @@ def _draw_registration_result(
     source_temp.paint_uniform_color([1, 0.706, 0])
     target_temp.paint_uniform_color([0, 0.651, 0.929])
     source_temp.transform(transformation)
-    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=200.0, origin=[0, 0, 0])
     object_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=200.0, origin=[0, 0, 0])
-    object_frame.transform(transformation)
+    object_frame.transform(transformation @ VIS_FRAME_FLIP_Y)
     o3d.visualization.draw_geometries(
-        [source_temp, target_temp, coordinate_frame, object_frame],
-        zoom=0.4459,
-        front=[0.9288, -0.2951, -0.2242],
-        lookat=[1.6784, 2.0612, 1.4451],
-        up=[-0.3402, -0.9189, -0.1996],
+        [source_temp, target_temp, object_frame],
+        zoom=ICP_VIEW_ZOOM,
+        front=ICP_VIEW_FRONT,
+        lookat=ICP_VIEW_LOOKAT,
+        up=ICP_VIEW_UP,
     )
+
+
+def _mesh_vertices_in_m(mesh: o3d.geometry.TriangleMesh) -> np.ndarray:
+    verts = np.asarray(mesh.vertices)
+    if verts.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    verts_m = verts.astype(np.float32, copy=True)
+    extent = np.max(np.ptp(verts_m, axis=0))
+    if extent > 1.0:
+        verts_m *= 0.001
+    return verts_m
+
+
+def _project_points_to_image(
+    points_cam_m: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if points_cam_m.size == 0:
+        return np.empty((0, 2), dtype=np.int32), np.zeros((0,), dtype=bool)
+    z = points_cam_m[:, 2]
+    valid = z > 1e-6
+    if not np.any(valid):
+        return np.empty((0, 2), dtype=np.int32), valid
+    pts = points_cam_m[valid]
+    u = (pts[:, 0] * K[0, 0] / pts[:, 2]) + K[0, 2]
+    v = (pts[:, 1] * K[1, 1] / pts[:, 2]) + K[1, 2]
+    uv = np.round(np.stack([u, v], axis=1)).astype(np.int32)
+    in_bounds = (
+        (uv[:, 0] >= 0)
+        & (uv[:, 0] < width)
+        & (uv[:, 1] >= 0)
+        & (uv[:, 1] < height)
+    )
+    return uv[in_bounds], valid
+
+
+def _draw_projected_points(
+    image: np.ndarray,
+    points_cam_m: np.ndarray,
+    K: np.ndarray,
+    color: Tuple[int, int, int],
+    radius: int,
+    max_points: int = 500,
+) -> None:
+    if points_cam_m is None or points_cam_m.size == 0:
+        return
+    points = points_cam_m
+    if points.shape[0] > max_points:
+        step = max(1, points.shape[0] // max_points)
+        points = points[::step]
+    uv, _ = _project_points_to_image(points, K, image.shape[1], image.shape[0])
+    for u, v in uv:
+        if radius <= 0:
+            image[int(v), int(u)] = color
+        else:
+            cv2.circle(image, (int(u), int(v)), radius, color, -1, lineType=cv2.LINE_AA)
+
+
+def _draw_object_axes_overlay(
+    image: np.ndarray,
+    pose_cam_m: np.ndarray,
+    K: np.ndarray,
+    axis_length_m: float = 0.05,
+) -> None:
+    origin = pose_cam_m[:3, 3]
+    axes = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [axis_length_m, 0.0, 0.0],
+            [0.0, -axis_length_m, 0.0],
+            [0.0, 0.0, axis_length_m],
+        ],
+        dtype=np.float32,
+    )
+    pts_cam = (pose_cam_m[:3, :3] @ axes.T).T + origin
+    uv, _ = _project_points_to_image(pts_cam, K, image.shape[1], image.shape[0])
+    if uv.shape[0] != 4:
+        return
+    origin_uv = tuple(int(x) for x in uv[0])
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+    for idx, color in enumerate(colors, start=1):
+        tip_uv = tuple(int(x) for x in uv[idx])
+        cv2.line(image, origin_uv, tip_uv, color, 2, lineType=cv2.LINE_AA)
+        cv2.circle(image, tip_uv, 4, color, -1, lineType=cv2.LINE_AA)
+    cv2.circle(image, origin_uv, 4, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
 
 def _draw_overlays(
@@ -476,6 +579,9 @@ def _draw_overlays(
     masks_nhw: torch.Tensor,
     scores_n: torch.Tensor,
     poses: List[Optional[np.ndarray]],
+    K: Optional[np.ndarray],
+    mesh: Optional[o3d.geometry.TriangleMesh],
+    pointclouds_mm: Optional[List[Optional[np.ndarray]]],
     alpha: float,
     max_show: int,
     object_id: str = "",
@@ -529,6 +635,21 @@ def _draw_overlays(
         else:
             alpha_i = alpha * 0.25
         out = cv2.addWeighted(overlay, alpha_i, out, 1 - alpha_i, 0)
+        if (
+            K is not None
+            and mesh is not None
+            and i < len(poses)
+            and poses[i] is not None
+        ):
+            pose_cam_m = poses[i]
+            mesh_pts_obj_m = _mesh_vertices_in_m(mesh)
+            if mesh_pts_obj_m.size > 0:
+                mesh_pts_cam_m = (pose_cam_m[:3, :3] @ mesh_pts_obj_m.T).T + pose_cam_m[:3, 3]
+                _draw_projected_points(out, mesh_pts_cam_m, K, (0, 200, 255), radius=1, max_points=3000)
+            if pointclouds_mm is not None and i < len(pointclouds_mm) and pointclouds_mm[i] is not None:
+                pc_cam_m = pointclouds_mm[i].astype(np.float32) * 0.001
+                _draw_projected_points(out, pc_cam_m, K, (255, 220, 0), radius=1, max_points=3000)
+            _draw_object_axes_overlay(out, pose_cam_m, K)
         bbox = _mask_bbox(mask_resized.astype(np.uint8))
         if bbox is not None:
             x0, y0, x1, y1 = bbox
@@ -562,6 +683,94 @@ def _draw_overlays(
                 )
                 out = cv2.addWeighted(anno, 0.3, out, 0.7, 0)
     return out
+
+
+def _draw_icp_overlay(
+    frame_bgr: np.ndarray,
+    poses: List[Optional[np.ndarray]],
+    K: Optional[np.ndarray],
+    mesh: Optional[o3d.geometry.TriangleMesh],
+    pointclouds_mm: Optional[List[Optional[np.ndarray]]],
+    object_id: str = "",
+) -> np.ndarray:
+    out = frame_bgr.copy()
+    if object_id:
+        cv2.putText(
+            out,
+            object_id,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 0),
+            4,
+        )
+        cv2.putText(
+            out,
+            object_id,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+    if K is None or mesh is None:
+        return out
+    mesh_pts_obj_m = _mesh_vertices_in_m(mesh)
+    for i, pose_cam_m in enumerate(poses):
+        if pose_cam_m is None:
+            continue
+        if mesh_pts_obj_m.size > 0:
+            mesh_pts_cam_m = (pose_cam_m[:3, :3] @ mesh_pts_obj_m.T).T + pose_cam_m[:3, 3]
+            _draw_projected_points(out, mesh_pts_cam_m, K, (0, 200, 255), radius=1, max_points=500)
+        if pointclouds_mm is not None and i < len(pointclouds_mm) and pointclouds_mm[i] is not None:
+            pc_cam_m = pointclouds_mm[i].astype(np.float32) * 0.001
+            _draw_projected_points(out, pc_cam_m, K, (255, 220, 0), radius=1, max_points=500)
+        _draw_object_axes_overlay(out, pose_cam_m, K)
+    return out
+
+
+def _label_panel(image: np.ndarray, title: str) -> np.ndarray:
+    out = image.copy()
+    cv2.rectangle(out, (0, 0), (220, 36), (20, 20, 20), -1)
+    cv2.putText(out, title, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    return out
+
+
+def _compose_detection_icp_vis(
+    frame_bgr: np.ndarray,
+    masks_nhw: torch.Tensor,
+    scores_n: torch.Tensor,
+    poses: List[Optional[np.ndarray]],
+    K: Optional[np.ndarray],
+    mesh: Optional[o3d.geometry.TriangleMesh],
+    pointclouds_mm: Optional[List[Optional[np.ndarray]]],
+    alpha: float,
+    max_show: int,
+    object_id: str = "",
+) -> np.ndarray:
+    detection_vis = _draw_overlays(
+        frame_bgr,
+        masks_nhw,
+        scores_n,
+        [None for _ in range(len(poses))],
+        K=None,
+        mesh=None,
+        pointclouds_mm=None,
+        alpha=alpha,
+        max_show=max_show,
+        object_id=object_id,
+    )
+    icp_vis = _draw_icp_overlay(
+        frame_bgr,
+        poses,
+        K=K,
+        mesh=mesh,
+        pointclouds_mm=pointclouds_mm,
+        object_id=object_id,
+    )
+    detection_vis = _label_panel(detection_vis, "Detection")
+    icp_vis = _label_panel(icp_vis, "ICP")
+    return np.hstack([detection_vis, icp_vis])
 
 
 def _resolve_mesh_path(mesh_dir: Path, mesh_path: str, object_id: str) -> Path:
@@ -700,7 +909,9 @@ class ExemplarPosePipeline:
                     box_preds[0], masks_nhw, scores_n, iou_threshold=self.nms_iou
                 )
 
-        poses: List[Optional[np.ndarray]] = []
+        poses: List[Optional[np.ndarray]] = [None for _ in range(int(masks_nhw.shape[0]))]
+        overlay_poses: List[Optional[np.ndarray]] = [None for _ in range(int(masks_nhw.shape[0]))]
+        pointclouds_mm: List[Optional[np.ndarray]] = [None for _ in range(int(masks_nhw.shape[0]))]
         icp_total_s = 0.0
         if masks_nhw.shape[0] > 0 and run_icp:
             h, w = frame_bgr.shape[:2]
@@ -716,7 +927,7 @@ class ExemplarPosePipeline:
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
                 t_icp_start = time.perf_counter()
-                pose = get_pose_from_mask(
+                pose, pointcloud_mm = get_pose_and_pointcloud_from_mask(
                     mask_resized.astype(np.uint8),
                     depth_image,
                     K,
@@ -724,21 +935,26 @@ class ExemplarPosePipeline:
                     visualize=self.visualize_icp,
                 )
                 icp_total_s += time.perf_counter() - t_icp_start
+                overlay_poses[i] = pose
                 if pose is not None and self.to_base:
                     pose = cam_frame_to_base_frame(pose)
-                poses.append(pose)
+                poses[i] = pose
+                pointclouds_mm[i] = pointcloud_mm
         elif masks_nhw.shape[0] > 0:
-            num_show = min(self.max_objects, masks_nhw.shape[0])
-            poses = [None for _ in range(num_show)]
+            poses = [None for _ in range(int(masks_nhw.shape[0]))]
+            overlay_poses = [None for _ in range(int(masks_nhw.shape[0]))]
         timings["icp_s"] = icp_total_s
 
         vis = None
         if draw_overlays:
-            vis = _draw_overlays(
+            vis = _compose_detection_icp_vis(
                 frame_bgr,
                 masks_nhw,
                 scores_n,
-                poses,
+                overlay_poses,
+                K=K,
+                mesh=self.mesh,
+                pointclouds_mm=pointclouds_mm,
                 alpha=alpha,
                 max_show=max_show,
                 object_id=self.object_id,

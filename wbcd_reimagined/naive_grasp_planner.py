@@ -14,6 +14,7 @@ Assumptions:
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 from dataclasses import dataclass
@@ -22,6 +23,11 @@ from typing import Iterable, Optional
 
 import numpy as np
 import open3d as o3d
+
+ICP_VIEW_FRONT = [0.9288, -0.2951, -0.2242]
+ICP_VIEW_UP = [-0.3402, -0.9189, -0.1996]
+GRASP_VIEW_ZOOM = 0.7
+VIS_FRAME_FLIP_Y = np.diag([1.0, -1.0, 1.0, 1.0])
 
 
 @dataclass(frozen=True)
@@ -40,7 +46,7 @@ class PlannerParams:
     num_surface_points: int = 6000
     max_pairs: int = 3000
     normal_dot_threshold: float = -0.3
-    min_width: float = 0.0
+    min_width: float = 0.01
     z_band_ratio: float = 0.01
     use_convex_hull: bool = False
 
@@ -52,6 +58,7 @@ class GraspCandidate:
     midpoint: np.ndarray
     distance: float
     normal_opposition: float
+    grasp_outer_edge: float
     contact_i: np.ndarray
     contact_j: np.ndarray
     normal_i: np.ndarray
@@ -154,31 +161,38 @@ def _score_candidate(
     midpoint: np.ndarray,
     obj_center: np.ndarray,
     obj_scale: float,
+    xy_scale: float,
     axis_vec: np.ndarray,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
+    def _outer_edge_term(contact: np.ndarray) -> float:
+        radial_xy = float(np.linalg.norm((contact - obj_center)[:2]))
+        return math.sqrt(max(0.0, radial_xy) / max(1e-6, xy_scale))
+
     dot = float(np.dot(_normalize(normal_i), _normalize(normal_j)))
     normal_opposition = (1.0 - dot) / 2.0
     axis = _normalize(closing_axis)
     perp_i = abs(float(np.dot(_normalize(normal_i), axis)))
     perp_j = abs(float(np.dot(_normalize(normal_j), axis)))
     perp_score = 0.5 * (perp_i + perp_j)
+    grasp_outer_edge = 0.5 * (_outer_edge_term(contact_i) + _outer_edge_term(contact_j))
     center_dist = float(np.linalg.norm(midpoint - obj_center))
     center_score = math.exp(-center_dist / max(1e-6, 0.5 * obj_scale))
-    score = 0.45 * normal_opposition + 0.5 * perp_score + 0.05 * center_score
+    score = 0.45 * normal_opposition + 0.5 * perp_score + 0.25 * center_score
 
     face_score = 0.5 * (
         abs(float(np.dot(_normalize(normal_i), axis_vec)))
         + abs(float(np.dot(_normalize(normal_j), axis_vec)))
     )
     score += 0.2 * face_score
+    # score += 0.15 * grasp_outer_edge
 
     # Penalize inward-pointing normals (toward grasp midpoint).
     to_mid_i = _normalize(midpoint - contact_i)
     to_mid_j = _normalize(midpoint - contact_j)
     if float(np.dot(_normalize(normal_i), to_mid_i)) > 0.0 or float(np.dot(_normalize(normal_j), to_mid_j)) > 0.0:
-        score *= 0.5
+        score *= 0.2
 
-    return score, normal_opposition, perp_score
+    return score, normal_opposition, perp_score, grasp_outer_edge
 
 
 def plan_grasps(
@@ -197,7 +211,7 @@ def plan_grasps(
     )
     aabb = mesh.get_axis_aligned_bounding_box()
     z_min, z_max = float(aabb.min_bound[2]), float(aabb.max_bound[2])
-    z_mid = float(z_min + 0.4 * (z_max - z_min))
+    z_mid = float(z_min + 0.5 * (z_max - z_min))
     z_band = planner.z_band_ratio * (z_max - z_min)
     band_mask = np.abs(points[:, 2] - z_mid) <= z_band
     points = points[band_mask]
@@ -218,6 +232,7 @@ def plan_grasps(
         return []
     obj_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     obj_scale = float(np.linalg.norm(aabb.get_extent()))
+    xy_scale = float(min(aabb.get_extent()[0], aabb.get_extent()[1]))
     short_axis = int(np.argmin(aabb.get_extent()))
     axis_vec = np.eye(3, dtype=np.float64)[short_axis]
 
@@ -230,7 +245,7 @@ def plan_grasps(
             continue
         tip_mid = (T @ np.array([0.0, gripper.finger_length, 0.0, 1.0], dtype=np.float64))[:3]
         closing_axis = p_j - p_i
-        score, normal_opposition, _ = _score_candidate(
+        score, normal_opposition, _, grasp_outer_edge = _score_candidate(
             p_i,
             p_j,
             normals[i],
@@ -239,6 +254,7 @@ def plan_grasps(
             midpoint=tip_mid,
             obj_center=obj_center,
             obj_scale=obj_scale,
+            xy_scale=xy_scale,
             axis_vec=axis_vec,
         )
         candidates.append(
@@ -248,6 +264,7 @@ def plan_grasps(
                 midpoint=tip_mid,
                 distance=dist,
                 normal_opposition=normal_opposition,
+                grasp_outer_edge=grasp_outer_edge,
                 contact_i=p_i.copy(),
                 contact_j=p_j.copy(),
                 normal_i=normals[i].copy(),
@@ -365,6 +382,21 @@ def _normal_arrow(center: np.ndarray, normal: np.ndarray, length: float) -> o3d.
     return arrow
 
 
+def apply_temporary_display_transform(
+    geometries: Iterable[o3d.geometry.Geometry],
+) -> list[o3d.geometry.Geometry]:
+    # Temporary visualization-only adjustment: rotate +90 deg about Y, then -90 deg about the rotated local X axis.
+    display_rot = np.eye(4, dtype=np.float64)
+    display_rot[:3, :3] = (
+        o3d.geometry.get_rotation_matrix_from_xyz((0.0, math.pi / 2, 0.0))
+
+    )
+    out = list(geometries)
+    for geom in out:
+        geom.transform(display_rot)
+    return out
+
+
 def demo(
     mesh_path: str,
     top_k: int = 2,
@@ -437,12 +469,13 @@ def demo(
 
     axis_len = 0.6 * float(np.max(bbox_size))
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_len, origin=[0.0, 0.0, 0.0])
+    axis.transform(VIS_FRAME_FLIP_Y)
     axis.compute_vertex_normals()
     mesh.compute_vertex_normals()
     mesh.paint_uniform_color([0.7, 0.7, 0.7])
 
     geometries = [
-        {"name": "mesh", "geometry": mesh, "material": _transparent_material(0.25)},
+        {"name": "mesh", "geometry": mesh, "material": _transparent_material(0.6)},
         {"name": "axis", "geometry": axis},
     ]
     gidx = 0
@@ -507,7 +540,19 @@ def demo(
                 }
             )
             gidx += 1
-    o3d.visualization.draw(geometries, title="Naive Grasp Planner")
+    draw_geometries = [
+        geom["geometry"] if isinstance(geom, dict) else geom
+        for geom in geometries
+    ]
+    draw_geometries = apply_temporary_display_transform(draw_geometries)
+    o3d.visualization.draw_geometries(
+        draw_geometries,
+        window_name="Naive Grasp Planner",
+        zoom=GRASP_VIEW_ZOOM,
+        front=ICP_VIEW_FRONT,
+        lookat=[0.0, 0.0, 0.0],
+        up=ICP_VIEW_UP,
+    )
     return grasps[0].pose.copy()
 
 
@@ -522,15 +567,15 @@ def main() -> None:
     parser.add_argument(
         "--mesh_dir",
         type=str,
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/mesh_0316",
+        default="assets/mesh_0316",
     )
     parser.add_argument("--mesh_path", type=str, default="")
-    parser.add_argument("--object_id", type=str, default="lego_brick")
-    parser.add_argument("--top_k", type=int, default=2)
+    parser.add_argument("--object_id", type=str, default="rod_mount")
+    parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--use_convex_hull",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
         help="If true, sample grasp contacts on the mesh convex hull instead of the raw mesh surface.",
     )

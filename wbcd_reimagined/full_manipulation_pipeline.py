@@ -24,8 +24,9 @@ from wbcd_reimagined.naive_grasp_planner import GripperParams, PlannerParams, pl
 from wbcd_reimagined.run_realsense_exemplar_pose import (
     ExemplarPosePipeline,
     Realsense,
-    _draw_overlays,
+    _compose_detection_icp_vis,
     _resolve_mesh_path,
+    get_pose_and_pointcloud_from_mask,
     get_pose_from_mask,
     load_detector_model,
 )
@@ -45,7 +46,7 @@ FIXED_TAIL = (180.0, 0.0, 90.0, 0.0)
 MIN_ROBOT_Z = -0.07
 DROP_OFF_POSES = {
     "gear": (0.3, 0.30, 0.04, 180.0, 0.0, 90.0, 0.0),
-    "rod_stand": (0.43, 0.30, 0.04, 180.0, 0.0, 90.0, 0.0),
+    "rod_mount": (0.43, 0.30, 0.04, 180.0, 0.0, 90.0, 0.0),
     "bowl": (0.43, 0.40, 0.04, 180.0, 0.0, 90.0, 0.0),
     "cube": (0.43, 0.38, 0.04, 180.0, 0.0, 90.0, 0.0),
     "square_tube": (0.43, 0.30, 0.04, 180.0, 0.0, 90.0, 0.0),
@@ -61,7 +62,7 @@ GRASP_METHODS = GraspMethods()
 GRASP_METHODS.register("bowl", GraspSpec(0.0, -0.05, 0.0, gripper_close_pos=0.98, use_object_yaw=False, use_convex_hull=False))
 GRASP_METHODS.register("cube", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.5, use_object_yaw=True, use_convex_hull=False))
 GRASP_METHODS.register("gear", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=True))
-GRASP_METHODS.register("rod_stand", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=False))
+GRASP_METHODS.register("rod_mount", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=False))
 GRASP_METHODS.register("square_tube", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.7, use_object_yaw=True, use_convex_hull=True))
 GRASP_METHODS.register("bolt", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.85, use_object_yaw=True, use_convex_hull=True))
 GRASP_METHODS.register("lego_brick", GraspSpec(0.0, 0.0, 0.0, gripper_close_pos=0.8, use_object_yaw=True, use_convex_hull=True))
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--mesh_path", type=str, default="")
-    parser.add_argument("--object_ids", type=str, default="bolt, gear, lego_brick")
+    parser.add_argument("--object_ids", type=str, default="gear")
     parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true")
@@ -123,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rs_timeout_ms", type=int, default=50000)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5001)
-    parser.add_argument("--dryrun", default=False, action="store_true", help="Run without robot connection.")
+    parser.add_argument("--dryrun", default=True, action="store_true", help="Run without robot connection.")
     parser.add_argument(
         "--predict_grasp_pose",
         default=True,
@@ -315,7 +316,7 @@ def main() -> None:
     args = parse_args()
     object_ids = [s.strip() for s in args.object_ids.split(",") if s.strip()]
     if len(object_ids) < 1:
-        raise ValueError("object_ids must contain at least one id, e.g. gear or gear,rod_stand")
+        raise ValueError("object_ids must contain at least one id, e.g. gear or gear,rod_mount")
 
     ref_dirs = _parse_dir_list(args.reference_dir, "reference_dir")
     if not ref_dirs:
@@ -459,6 +460,7 @@ def main() -> None:
 
             pose_cam = None
             per_obj_pose = {}
+            per_obj_pointcloud_mm = {}
             per_obj_pose_robot = {}
             per_obj_icp_time_s = {}
             if per_obj_best:
@@ -470,7 +472,7 @@ def main() -> None:
                         interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
                     t_icp_start = time.perf_counter()
-                    pose = get_pose_from_mask(
+                    pose, pointcloud_mm = get_pose_and_pointcloud_from_mask(
                         mask_resized.astype(np.uint8),
                         depth_image,
                         realsense.K,
@@ -479,6 +481,7 @@ def main() -> None:
                     )
                     per_obj_icp_time_s[obj_id] = time.perf_counter() - t_icp_start
                     per_obj_pose[obj_id] = pose
+                    per_obj_pointcloud_mm[obj_id] = pointcloud_mm
                     if pose is not None:
                         per_obj_pose_robot[obj_id] = _transform_pose(T_RC, pose)
                 # choose best object in guard
@@ -527,11 +530,14 @@ def main() -> None:
                             best_idx = int(np.argmax(scores_cpu))
                             if best_idx < num_show:
                                 poses_show[best_idx] = per_obj_pose.get(obj_id)
-                    vis = _draw_overlays(
+                    vis = _compose_detection_icp_vis(
                         frame_bgr,
                         masks_nhw,
                         scores_n,
                         poses_show,
+                        K=realsense.K,
+                        mesh=meshes[obj_id],
+                        pointclouds_mm=[per_obj_pointcloud_mm.get(obj_id) if p is not None else None for p in poses_show],
                         alpha=args.alpha,
                         max_show=args.max_show,
                         object_id=obj_id,

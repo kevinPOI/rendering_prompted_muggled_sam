@@ -654,6 +654,7 @@ def save_mask_triptych(
     ref_view_ids: List[str],
     image_name: str,
     output_path: str,
+    vis_score_threshold: float = 0.15,
 ) -> None:
     h, w = image_bgr.shape[:2]
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -708,9 +709,10 @@ def save_mask_triptych(
             )
 
     if num_masks > 0:
-        topk = min(2, num_masks, int(scores_cpu.size))
+        valid_idx = np.where(scores_cpu >= vis_score_threshold)[0]
+        topk = min(2, int(valid_idx.size))
         if topk > 0:
-            top_idx = np.argsort(scores_cpu)[-topk:][::-1]
+            top_idx = valid_idx[np.argsort(scores_cpu[valid_idx])[-topk:][::-1]]
         else:
             top_idx = []
     else:
@@ -837,7 +839,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=24)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument(
         "--sub_sample",
         type=int,
@@ -861,6 +863,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Save a debug collage every N batches (0 disables).",
+    )
+    parser.add_argument(
+        "--vis_score_thresh",
+        type=float,
+        default=0.15,
+        help="Visualization-only score threshold; does not affect model outputs or metrics.",
     )
     parser.add_argument(
         "--image_list",
@@ -1175,6 +1183,7 @@ def main() -> None:
                                 ref_view_ids=ref_view_ids,
                                 image_name=prepared[data_idx]["rgb_path"],
                                 output_path=out_path,
+                                vis_score_threshold=args.vis_score_thresh,
                             )
 
                 if batch_ious:
