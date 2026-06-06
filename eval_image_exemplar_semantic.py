@@ -25,6 +25,8 @@ from muggled_sam.make_sam import make_sam_from_state_dict
 
 
 IGNORED_LABELS = {"BACKGROUND", "UNLABELLED"}
+ITODD_DATASET_ROOT = "/sata1/data/kevin/bop_datasets/ITODD"
+ITODD_REFERENCE_DIR = "/sata1/data/kevin/bop_datasets/ITODD/models_rendered_blender"
 
 
 def parse_color_key(key: str) -> Tuple[int, ...]:
@@ -113,6 +115,58 @@ def collect_multi_object_samples(
     return object_map, all_entries
 
 
+def collect_itodd_object_samples(
+    dataset_root: str,
+    sub_sample: int = 1,
+) -> Tuple[Dict[str, List[Dict[str, str]]], List[Dict[str, str]]]:
+    dataset_path = Path(dataset_root).expanduser().resolve()
+    targets_path = dataset_path / "itodd" / "test_targets_bop19.json"
+    if not targets_path.is_file():
+        raise FileNotFoundError(targets_path)
+    if sub_sample < 1:
+        raise ValueError("sub_sample must be >= 1")
+
+    with open(targets_path, "r") as handle:
+        targets = json.load(handle)
+
+    object_map: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    all_entries: List[Dict[str, str]] = []
+    for idx, target in enumerate(targets):
+        if sub_sample > 1 and (idx % sub_sample) != 0:
+            continue
+        scene_id = int(target["scene_id"])
+        im_id = int(target["im_id"])
+        obj_id = int(target["obj_id"])
+        inst_count = int(target.get("inst_count", 0))
+        scene_dir = dataset_path / "test" / f"{scene_id:06d}"
+        gray_dir = scene_dir / "gray"
+        mask_dir = scene_dir / "mask_visib"
+        rgb_path = gray_dir / f"{im_id:06d}.tif"
+        if not rgb_path.is_file():
+            png_fallback = gray_dir / f"{im_id:06d}.png"
+            if png_fallback.is_file():
+                rgb_path = png_fallback
+        if not (rgb_path.is_file() and mask_dir.is_dir()):
+            continue
+
+        object_id = f"obj_{obj_id:06d}"
+        frame_id = f"{scene_id:06d}_{im_id:06d}"
+        entry = {
+            "object_id": object_id,
+            "frame_id": frame_id,
+            "rgb_path": str(rgb_path),
+            "inst_path": str(mask_dir),
+            "scene_id": scene_id,
+            "im_id": im_id,
+            "inst_count": inst_count,
+        }
+        object_map[object_id].append(entry)
+        all_entries.append(entry)
+    if not all_entries:
+        raise RuntimeError(f"No ITODD samples found under {dataset_root}")
+    return dict(object_map), all_entries
+
+
 def load_instance_mask(inst_path: str, color: Tuple[int, ...]) -> np.ndarray:
     seg = load_instance_segmentation(inst_path)
     return mask_for_color(seg, color)
@@ -198,6 +252,26 @@ def load_mask_gray(path: str) -> np.ndarray:
     if mask is None:
         raise FileNotFoundError(path)
     return (mask > 0).astype(np.uint8)
+
+
+def load_itodd_masks(
+    mask_dir: str,
+    im_id: int,
+    inst_count: int = 0,
+) -> List[np.ndarray]:
+    mask_dir_path = Path(mask_dir)
+    mask_paths = sorted(mask_dir_path.glob(f"{im_id:06d}_*.png"))
+    if inst_count > 0 and len(mask_paths) > inst_count:
+        mask_paths = mask_paths[:inst_count]
+    masks: List[np.ndarray] = []
+    for mask_path in mask_paths:
+        try:
+            mask = load_mask_gray(str(mask_path))
+        except FileNotFoundError:
+            continue
+        if mask.sum() > 0:
+            masks.append(mask)
+    return masks
 
 
 def sample_points_from_mask(mask_image: np.ndarray, num_points_approx: int = 25) -> List[Tuple[float, float]]:
@@ -369,134 +443,97 @@ def encode_exemplars_no_infer(
     return torch.cat((encoded_sampling_bnc, encoded_text_bnc), dim=1)
 
 
-def select_best_mask(mask_preds_nhw: torch.Tensor, gt_mask_hw: torch.Tensor) -> Tuple[int, torch.Tensor]:
-    pred_bin = mask_preds_nhw > 0
-    gt_bin = gt_mask_hw > 0.5
-    intersection = (pred_bin & gt_bin).sum(dim=(1, 2))
-    union = (pred_bin | gt_bin).sum(dim=(1, 2)).clamp_min(1)
-    iou = intersection.float() / union.float()
-    best_idx = int(torch.argmax(iou).item())
-    return best_idx, iou[best_idx]
-
-
 def compute_mask_iou(pred_mask_hw: torch.Tensor, gt_mask_hw: torch.Tensor) -> torch.Tensor:
     pred_bin = pred_mask_hw > 0
     gt_bin = gt_mask_hw > 0.5
-    intersection = (pred_bin & gt_bin).sum()
-    union = (pred_bin | gt_bin).sum().clamp_min(1)
+    intersection = (pred_bin & gt_bin).sum().float()
+    union = (pred_bin | gt_bin).sum()
+    if int(union.item()) == 0:
+        return intersection.new_tensor(1.0)
+    union = union.float()
     return intersection.float() / union.float()
 
 
-def match_masks_to_gts(
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    iou_threshold: float = 0.5,
-) -> List[Tuple[int, int, float]]:
-    if not pred_masks or not gt_masks:
-        return []
-    pairs: List[Tuple[float, int, int]] = []
-    for p_idx, pred in enumerate(pred_masks):
-        for g_idx, gt in enumerate(gt_masks):
-            iou = compute_mask_iou(pred, gt)
-            iou_val = float(iou.item())
-            if iou_val >= iou_threshold:
-                pairs.append((iou_val, p_idx, g_idx))
-    pairs.sort(key=lambda x: x[0], reverse=True)
-
-    matched_pred = [False] * len(pred_masks)
-    matched_gt = [False] * len(gt_masks)
-    matches: List[Tuple[int, int, float]] = []
-    for iou_val, p_idx, g_idx in pairs:
-        if matched_pred[p_idx] or matched_gt[g_idx]:
-            continue
-        matched_pred[p_idx] = True
-        matched_gt[g_idx] = True
-        matches.append((p_idx, g_idx, iou_val))
-    return matches
+def merge_binary_masks(
+    masks: List[torch.Tensor],
+    empty_shape_hw: Tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    if not masks:
+        return torch.zeros(empty_shape_hw, device=device, dtype=torch.bool)
+    merged = torch.zeros_like(masks[0], dtype=torch.bool, device=device)
+    for mask in masks:
+        merged |= mask.to(device=device) > 0.5
+    return merged
 
 
-def compute_pq_stats(
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    pred_scores: Optional[torch.Tensor] = None,
-    iou_threshold: float = 0.5,
-    score_threshold: float = 0.25,
-) -> Tuple[float, int, int, int]:
-    if pred_scores is not None and pred_masks:
-        filtered_masks: List[torch.Tensor] = []
-        for idx, mask in enumerate(pred_masks):
-            if float(pred_scores[idx].item()) >= score_threshold:
-                filtered_masks.append(mask)
-        pred_masks = filtered_masks
-
-    if not pred_masks and not gt_masks:
-        return 0.0, 0, 0, 0
-    if not pred_masks:
-        return 0.0, 0, 0, len(gt_masks)
-    if not gt_masks:
-        return 0.0, 0, len(pred_masks), 0
-
-    matches = match_masks_to_gts(pred_masks, gt_masks, iou_threshold=iou_threshold)
-    sum_iou = sum(match[2] for match in matches)
-    tp = len(matches)
-
-    fp = len(pred_masks) - tp
-    fn = len(gt_masks) - tp
-    return sum_iou, tp, fp, fn
+def keep_top_masks(
+    mask_preds_nhw: torch.Tensor,
+    det_scores_n: torch.Tensor,
+    top_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if det_scores_n.numel() == 0 or top_k <= 0:
+        return mask_preds_nhw[:0], det_scores_n[:0]
+    keep_k = min(top_k, int(det_scores_n.numel()))
+    return mask_preds_nhw[:keep_k], det_scores_n[:keep_k]
 
 
-def update_pq_accumulators(
-    pq_stats: Dict[float, Dict[str, float]],
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    pred_scores: Optional[torch.Tensor],
-    iou_threshold: float,
-) -> None:
-    for score_threshold, stats in pq_stats.items():
-        sum_iou, tp, fp, fn = compute_pq_stats(
-            pred_masks,
-            gt_masks,
-            pred_scores=pred_scores,
-            iou_threshold=iou_threshold,
-            score_threshold=score_threshold,
-        )
-        stats["sum_iou"] += sum_iou
-        stats["tp"] += tp
-        stats["fp"] += fp
-        stats["fn"] += fn
+def merge_pred_masks_by_threshold(
+    mask_preds_nhw: torch.Tensor,
+    det_scores_n: torch.Tensor,
+    score_threshold: float,
+) -> torch.Tensor:
+    if det_scores_n.numel() == 0:
+        return torch.zeros(mask_preds_nhw.shape[-2:], device=mask_preds_nhw.device, dtype=torch.bool)
+    keep_mask = det_scores_n >= score_threshold
+    if not bool(keep_mask.any().item()):
+        return torch.zeros(mask_preds_nhw.shape[-2:], device=mask_preds_nhw.device, dtype=torch.bool)
+    return (mask_preds_nhw[keep_mask] > 0).any(dim=0)
 
 
-def build_detection_record(
+def build_semantic_eval_record(
     object_id: str,
     frame_id: str,
-    pred_scores: Optional[torch.Tensor],
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    iou_threshold: float,
-    top_k: int = 5,
+    pred_masks_nhw: torch.Tensor,
+    pred_scores_n: torch.Tensor,
+    gt_mask_hw: torch.Tensor,
 ) -> Dict[str, object]:
-    matches = match_masks_to_gts(pred_masks, gt_masks, iou_threshold=iou_threshold)
-    match_by_pred = {p_idx: (g_idx, iou_val) for p_idx, g_idx, iou_val in matches}
-    scores_cpu: Optional[torch.Tensor] = None
-    if pred_scores is not None:
-        scores_cpu = pred_scores.detach().float().cpu()
-
-    record: Dict[str, object] = {
+    return {
         "object_id": object_id,
         "frame_id": frame_id,
-        "num_gt": len(gt_masks),
-        "num_pred": len(pred_masks),
+        "pred_masks": (pred_masks_nhw > 0).detach().cpu(),
+        "pred_scores": pred_scores_n.detach().float().cpu(),
+        "gt_mask": (gt_mask_hw > 0).detach().cpu(),
     }
-    for idx in range(top_k):
-        score_val: Optional[float] = None
-        if scores_cpu is not None and idx < scores_cpu.numel():
-            score_val = float(scores_cpu[idx].item())
-        record[f"mask{idx + 1}_score"] = score_val
-        if idx in match_by_pred:
-            record[f"mask{idx + 1}_matched_gt"] = int(match_by_pred[idx][0])
-        else:
-            record[f"mask{idx + 1}_matched_gt"] = None
-    return record
+
+
+def compute_record_iou_at_threshold(record: Dict[str, object], score_threshold: float) -> float:
+    pred_masks = record["pred_masks"]
+    pred_scores = record["pred_scores"]
+    gt_mask = record["gt_mask"]
+    merged_pred = merge_pred_masks_by_threshold(pred_masks, pred_scores, score_threshold)
+    return float(compute_mask_iou(merged_pred, gt_mask).item())
+
+
+def evaluate_semantic_records(
+    records: List[Dict[str, object]],
+    score_threshold: float,
+) -> Tuple[float, Dict[str, float], Dict[str, int]]:
+    if not records:
+        return 0.0, {}, {}
+
+    iou_sum = 0.0
+    object_iou_sum: Dict[str, float] = defaultdict(float)
+    object_iou_count: Dict[str, int] = defaultdict(int)
+    for record in records:
+        iou = compute_record_iou_at_threshold(record, score_threshold)
+        iou_sum += iou
+        object_id = str(record["object_id"])
+        object_iou_sum[object_id] += iou
+        object_iou_count[object_id] += 1
+
+    mean_iou = iou_sum / max(1, len(records))
+    return mean_iou, object_iou_sum, object_iou_count
 
 
 def apply_mask_nms(
@@ -649,6 +686,10 @@ def save_mask_triptych(
     mask_preds_nhw: torch.Tensor,
     detection_scores_n: torch.Tensor,
     gt_masks: Optional[List[np.ndarray]],
+    merged_pred_mask_hw: Optional[torch.Tensor],
+    merged_gt_mask_hw: Optional[torch.Tensor],
+    semantic_threshold: float,
+    semantic_iou: Optional[float],
     object_id: str,
     reference_dir: Path,
     ref_view_ids: List[str],
@@ -657,7 +698,7 @@ def save_mask_triptych(
 ) -> None:
     h, w = image_bgr.shape[:2]
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    fig, axes = plt.subplots(1, 3, figsize=(18, 8))
+    fig, axes = plt.subplots(1, 5, figsize=(30, 8))
     fig.suptitle(f"image={image_name} | object_id={object_id}", fontsize=12)
 
     ref_images = load_reference_images(object_id, reference_dir, ref_view_ids)
@@ -667,6 +708,17 @@ def save_mask_triptych(
 
     axes[1].imshow(image_rgb)
     axes[2].imshow(image_rgb)
+    axes[3].imshow(image_rgb)
+    axes[4].imshow(image_rgb)
+
+    axes[0].set_title("References")
+    axes[1].set_title("GT Instances")
+    axes[2].set_title("GT Merged")
+    axes[3].set_title("Pred Instances")
+    if semantic_iou is None:
+        axes[4].set_title(f"Merged Semantic @{semantic_threshold:.2f}")
+    else:
+        axes[4].set_title(f"Merged Semantic @{semantic_threshold:.2f} IoU={semantic_iou:.3f}")
 
     palette = plt.get_cmap("tab10").colors
     scores_cpu = detection_scores_n.detach().float().cpu().numpy() if detection_scores_n.numel() > 0 else np.array([])
@@ -707,6 +759,15 @@ def save_mask_triptych(
                 verticalalignment="bottom",
             )
 
+    if merged_gt_mask_hw is not None:
+        merged_gt = merged_gt_mask_hw.detach().float().cpu().numpy()
+        merged_gt = cv2.resize(merged_gt, (w, h), interpolation=cv2.INTER_NEAREST)
+        if merged_gt.max() > 0:
+            rgba_gt = np.zeros((h, w, 4), dtype=np.float32)
+            rgba_gt[..., 0] = 1.0
+            rgba_gt[..., 3] = merged_gt * 0.6
+            axes[2].imshow(rgba_gt)
+
     if num_masks > 0:
         topk = min(2, num_masks, int(scores_cpu.size))
         if topk > 0:
@@ -727,7 +788,7 @@ def save_mask_triptych(
         rgba = np.zeros((h, w, 4), dtype=np.float32)
         rgba[..., :3] = color
         rgba[..., 3] = mask_resized * 0.5
-        axes[2].imshow(rgba)
+        axes[3].imshow(rgba)
 
         bbox = _mask_bbox(mask_resized)
         if bbox is None:
@@ -741,9 +802,9 @@ def save_mask_triptych(
             facecolor="none",
             linewidth=1.5,
         )
-        axes[2].add_patch(rect)
+        axes[3].add_patch(rect)
         score_val = float(scores_cpu[int(i)]) if scores_cpu.size > int(i) else 0.0
-        axes[2].text(
+        axes[3].text(
             x0,
             max(0, y0 - 4),
             f"(id={int(i)}, prob={score_val:.2f})",
@@ -751,6 +812,15 @@ def save_mask_triptych(
             fontsize=10,
             verticalalignment="bottom",
         )
+
+    if merged_pred_mask_hw is not None:
+        merged_pred = merged_pred_mask_hw.detach().float().cpu().numpy()
+        merged_pred = cv2.resize(merged_pred, (w, h), interpolation=cv2.INTER_NEAREST)
+        if merged_pred.max() > 0:
+            rgba_pred = np.zeros((h, w, 4), dtype=np.float32)
+            rgba_pred[..., 0] = 1.0
+            rgba_pred[..., 3] = merged_pred * 0.6
+            axes[4].imshow(rgba_pred)
 
     for ax in axes:
         ax.axis("off")
@@ -808,7 +878,7 @@ def build_exemplar_tokens_for_object(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate SAMv3 exemplar detection modules.")
+    parser = argparse.ArgumentParser(description="Evaluate SAMv3 exemplar detection modules for semantic masks.")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -821,16 +891,10 @@ def parse_args() -> argparse.Namespace:
     #     default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
     #     help="Comma-separated dataset roots.",
     # )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     type=str,
-    #     default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
-    #     help="Path to reference renders.",
-    # )
     parser.add_argument(
         "--reference_dir",
         type=str,
-        default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_4884_0510_test",
+        default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
         help="Path to reference renders.",
     )
     parser.add_argument(
@@ -890,19 +954,24 @@ def parse_args() -> argparse.Namespace:
 # ],
 #         help="Dataset roots (space-separated, and/or comma-separated).",
 #     )
-#     parser.add_argument(
-#         "--reference_dir",
-#         type=str,
-#         default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
-#         help="Path to reference renders.",
-#     )
+    parser.add_argument(
+        "--itodd",
+        action="store_true",
+        help="Load ITODD/BOP test targets instead of RGB+instance-mapping datasets.",
+    )
+    # parser.add_argument(
+    #     "--reference_dir",
+    #     type=str,
+    #     default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
+    #     help="Path to reference renders.",
+    # )
     #"0,3,6,9"
     #"0,1,2,3,4,5,6,7,8,9,10,11"
     parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=24)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
         "--sub_sample",
         type=int,
@@ -916,8 +985,38 @@ def parse_args() -> argparse.Namespace:
         help="IoU threshold for mask NMS (<=0 disables NMS).",
     )
     parser.add_argument("--det_filter", type=float, default=0.0)
-    parser.add_argument("--output_dir", type=str, default="outputs_eval_exemplar")
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--semantic_threshold",
+        type=float,
+        default=0.17,
+        help="Score threshold used for merged-mask mIoU reporting during evaluation.",
+    )
+    parser.add_argument(
+        "--semantic_top_k",
+        type=int,
+        default=6,
+        help="Maximum number of post-NMS predictions to retain per sample.",
+    )
+    parser.add_argument(
+        "--sweep_min",
+        type=float,
+        default=0.05,
+        help="Minimum score threshold for the final semantic mIoU sweep.",
+    )
+    parser.add_argument(
+        "--sweep_max",
+        type=float,
+        default=0.5,
+        help="Maximum score threshold for the final semantic mIoU sweep.",
+    )
+    parser.add_argument(
+        "--sweep_step",
+        type=float,
+        default=0.01,
+        help="Step size for the final semantic mIoU threshold sweep.",
+    )
+    parser.add_argument("--output_dir", type=str, default="outputs_semantic_eval")
+    parser.add_argument("--device", type=str, default="cuda:2")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--max_batches", type=int, default=0)
@@ -930,25 +1029,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image_list",
         type=str,
-        default="",
+        default="/sata1/data/kevin/realworld_datasets/3d_printing_dataset/rgb_0163.png",
         help="Comma-separated or Python list of full rgb image paths to evaluate.",
     )
     #[/sata1/data/kevin/realworld_datasets/primesense_converted/000011/rgb_0009.png]
     parser.add_argument("--grayscale", default = False, help="Convert all input images to grayscale.")
     parser.add_argument(
         "--multi_gt_only",
-        default = False,
+        default = True,
         help="Only evaluate samples with multiple GT instances for the target object.",
     )
-    parser.add_argument("--finetune_ckpt", type=str, default="finetune_exemplar/run_20260322_172059/finetune_epoch_034.pth", help="Optional finetuned detector checkpoint.")
+    parser.add_argument("--finetune_ckpt", type=str, default="", help="Optional finetuned detector checkpoint.")
+    # parser.add_argument("--finetune_ckpt", type=str, default="", help="Optional finetuned detector checkpoint.")
     return parser.parse_args()
 
 #/home/kevin/muggled_sam/finetune_exemplar/multi_object_best/finetune_epoch_017.pth
 def main() -> None:
     args = parse_args()
-    dataset_roots: List[str] = []
-    for item in args.dataset_root:
-        dataset_roots.extend([part.strip() for part in item.split(",") if part.strip()])
+    if args.itodd:
+        dataset_roots = [ITODD_DATASET_ROOT]
+        reference_dir = Path(ITODD_REFERENCE_DIR).expanduser().resolve()
+    else:
+        dataset_roots = []
+        for item in args.dataset_root:
+            dataset_roots.extend([part.strip() for part in item.split(",") if part.strip()])
+        reference_dir = Path(args.reference_dir).expanduser().resolve()
     if not dataset_roots:
         raise ValueError("No dataset roots provided.")
 
@@ -961,6 +1066,12 @@ def main() -> None:
         dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     else:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    if args.semantic_top_k < 0:
+        raise ValueError("--semantic_top_k must be >= 0")
+    if args.sweep_step <= 0:
+        raise ValueError("--sweep_step must be > 0")
+    if args.sweep_max < args.sweep_min:
+        raise ValueError("--sweep_max must be >= --sweep_min")
 
     _, base_model = make_sam_from_state_dict(args.model_path)
     base_model.to(device=device, dtype=dtype)
@@ -982,7 +1093,10 @@ def main() -> None:
     object_samples: Dict[str, List[Dict[str, str]]] = {}
     all_entries: List[Dict[str, str]] = []
     for root in dataset_roots:
-        cur_samples, cur_entries = collect_multi_object_samples(root, sub_sample=args.sub_sample)
+        if args.itodd:
+            cur_samples, cur_entries = collect_itodd_object_samples(root, sub_sample=args.sub_sample)
+        else:
+            cur_samples, cur_entries = collect_multi_object_samples(root, sub_sample=args.sub_sample)
         for obj_id, entries in cur_samples.items():
             object_samples.setdefault(obj_id, []).extend(entries)
         all_entries.extend(cur_entries)
@@ -1019,7 +1133,6 @@ def main() -> None:
         f"(entries={total_entries}, batch_size={args.batch_size})",
     )
 
-    reference_dir = Path(args.reference_dir).expanduser().resolve()
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
 
@@ -1030,30 +1143,61 @@ def main() -> None:
 
     total_iou_sum = 0.0
     total_iou_count = 0
-    total_correct_count = 0
     object_iou_sum: Dict[str, float] = defaultdict(float)
     object_iou_count: Dict[str, int] = defaultdict(int)
-    pq_iou_threshold = 0.5
-    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(89)]
-    pq_stats: Dict[float, Dict[str, float]] = {
-        thresh: {"sum_iou": 0.0, "tp": 0, "fp": 0, "fn": 0} for thresh in pq_score_thresholds
-    }
+    semantic_records: List[Dict[str, object]] = []
+    sweep_thresholds = np.arange(args.sweep_min, args.sweep_max + 0.5 * args.sweep_step, args.sweep_step)
+    sweep_thresholds = [round(float(thresh), 2) for thresh in sweep_thresholds]
 
-    detection_log_path = os.path.join(args.output_dir, "detection_log_tless_p2.json")
-    with open(detection_log_path, "w", encoding="utf-8") as detection_log:
-        with torch.no_grad():
-            for start in range(0, len(all_entries), args.batch_size):
-                subset = all_entries[start : start + args.batch_size]
-                prepared: List[Dict[str, object]] = []
-                for entry in subset:
-                    obj_id = entry["object_id"]
-                    try:
-                        image_bgr = load_bgr(entry["rgb_path"])
-                    except FileNotFoundError:
-                        continue
-                    if args.grayscale:
-                        image_bgr = apply_grayscale(image_bgr)
-                    try:
+    def append_semantic_result(
+        prepared_entry: Dict[str, object],
+        gt_mask_hw: torch.Tensor,
+        pred_masks_nhw: torch.Tensor,
+        pred_scores_n: torch.Tensor,
+        batch_ious: List[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        nonlocal total_iou_sum, total_iou_count
+
+        top_masks, top_scores = keep_top_masks(pred_masks_nhw, pred_scores_n, args.semantic_top_k)
+        record = build_semantic_eval_record(
+            prepared_entry["object_id"],
+            prepared_entry["frame_id"],
+            top_masks,
+            top_scores,
+            gt_mask_hw,
+        )
+        semantic_records.append(record)
+
+        miou = compute_record_iou_at_threshold(record, args.semantic_threshold)
+        batch_ious.append(miou)
+        total_iou_sum += miou
+        total_iou_count += 1
+
+        obj_id = str(prepared_entry["object_id"])
+        object_iou_sum[obj_id] += miou
+        object_iou_count[obj_id] += 1
+        return top_masks, top_scores, miou
+
+    with torch.no_grad():
+        for start in range(0, len(all_entries), args.batch_size):
+            subset = all_entries[start : start + args.batch_size]
+            prepared: List[Dict[str, object]] = []
+            for entry in subset:
+                obj_id = entry["object_id"]
+                try:
+                    image_bgr = load_bgr(entry["rgb_path"])
+                except FileNotFoundError:
+                    continue
+                if args.grayscale:
+                    image_bgr = apply_grayscale(image_bgr)
+                try:
+                    if args.itodd:
+                        gt_masks = load_itodd_masks(
+                            entry["inst_path"],
+                            int(entry["im_id"]),
+                            int(entry.get("inst_count", 0)),
+                        )
+                    else:
                         mapping_path = Path(entry["inst_path"]).with_name(
                             f"instance_segmentation_mapping_{entry['frame_id']}.json"
                         )
@@ -1064,221 +1208,190 @@ def main() -> None:
                             seg_cache=seg_cache,
                             mapping_cache=mapping_cache,
                         )
-                    except FileNotFoundError:
-                        continue
-                    if not gt_masks:
-                        continue
-                    if args.multi_gt_only and len(gt_masks) < 2:
-                        continue
-
-                    if obj_id not in ref_cache:
-                        exemplar_ref = build_exemplar_tokens_for_object(
-                            detmodel=detmodel,
-                            object_id=obj_id,
-                            reference_dir=reference_dir,
-                            ref_view_ids=ref_view_ids,
-                            max_side_length=args.max_side_length,
-                            use_square_sizing=not args.no_square,
-                            num_points_approx=args.num_points_approx,
-                            device=device,
-                            grayscale=args.grayscale,
-                        )
-                        if exemplar_ref is None:
-                            continue
-                        ref_cache[obj_id] = exemplar_ref.detach().cpu()
-
-                    exemplar_ref = ref_cache[obj_id]
-                    prepared.append(
-                        {
-                            "object_id": obj_id,
-                            "frame_id": entry["frame_id"],
-                            "rgb_path": entry["rgb_path"],
-                            "image_bgr": image_bgr,
-                            "gt_masks": gt_masks,
-                            "exemplar_ref": exemplar_ref,
-                        }
-                    )
-
-                if not prepared:
+                except FileNotFoundError:
                     continue
-                vis_target_idx = None
-                if args.vis_every > 0 and (batch_step % args.vis_every) == 0:
-                    vis_target_idx = random.randrange(len(prepared))
+                if not gt_masks:
+                    continue
+                if args.multi_gt_only and len(gt_masks) < 2:
+                    continue
 
-                group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-                for idx, entry in enumerate(prepared):
-                    img_t = detmodel.image_encoder.prepare_image(
-                        entry["image_bgr"],
+                if obj_id not in ref_cache:
+                    exemplar_ref = build_exemplar_tokens_for_object(
+                        detmodel=detmodel,
+                        object_id=obj_id,
+                        reference_dir=reference_dir,
+                        ref_view_ids=ref_view_ids,
                         max_side_length=args.max_side_length,
                         use_square_sizing=not args.no_square,
+                        num_points_approx=args.num_points_approx,
+                        device=device,
+                        grayscale=args.grayscale,
                     )
-                    entry["img_tensor"] = img_t
-                    entry["preencode_hw"] = img_t.shape[2:]
-                    shape_key = (img_t.shape[2], img_t.shape[3])
-                    group_map[shape_key].append(idx)
-
-                batch_ious: List[float] = []
-                batch_correct = 0
-                for _, idxs in group_map.items():
-                    img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
-                    t0 = time.time()
-                    encoded_img = detmodel.image_encoder(img_batch)
-                    encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
-                    t1 = time.time()
-                    exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                    exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
-
-                    mask_preds, box_preds, det_scores, pres_scores = generate_detections_train(
-                        detmodel,
-                        encoded_image_features_list,
-                        exemplar_batch,
-                        detection_filter_threshold=args.det_filter,
-                        exemplar_padding_mask_bn=padding_mask,
-                    )
-                    t2 = time.time()
-                    display_step = batch_step + 1
-                    print(
-                        "step {}/{} Batch encoding time: {:.3f}s, detection time: {:.3f}s".format(
-                            display_step,
-                            total_batches_est,
-                            t1 - t0,
-                            t2 - t1,
-                        )
-                    )
-                    if mask_preds.shape[1] == 0:
-                        for data_idx in idxs:
-                            preencode_hw = prepared[data_idx]["preencode_hw"]
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                    if exemplar_ref is None:
                         continue
+                    ref_cache[obj_id] = exemplar_ref.detach().cpu()
 
-                    for local_idx, data_idx in enumerate(idxs):
+                exemplar_ref = ref_cache[obj_id]
+                prepared.append(
+                    {
+                        "object_id": obj_id,
+                        "frame_id": entry["frame_id"],
+                        "rgb_path": entry["rgb_path"],
+                        "image_bgr": image_bgr,
+                        "gt_masks": gt_masks,
+                        "exemplar_ref": exemplar_ref,
+                    }
+                )
+
+            if not prepared:
+                continue
+            vis_target_idx = None
+            if args.vis_every > 0 and (batch_step % args.vis_every) == 0:
+                vis_target_idx = random.randrange(len(prepared))
+
+            group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+            for idx, entry in enumerate(prepared):
+                img_t = detmodel.image_encoder.prepare_image(
+                    entry["image_bgr"],
+                    max_side_length=args.max_side_length,
+                    use_square_sizing=not args.no_square,
+                )
+                entry["img_tensor"] = img_t
+                entry["preencode_hw"] = img_t.shape[2:]
+                shape_key = (img_t.shape[2], img_t.shape[3])
+                group_map[shape_key].append(idx)
+
+            batch_ious: List[float] = []
+            for _, idxs in group_map.items():
+                img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
+                t0 = time.time()
+                encoded_img = detmodel.image_encoder(img_batch)
+                encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
+                t1 = time.time()
+                exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
+                exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+
+                mask_preds, box_preds, det_scores, _ = generate_detections_train(
+                    detmodel,
+                    encoded_image_features_list,
+                    exemplar_batch,
+                    detection_filter_threshold=args.det_filter,
+                    exemplar_padding_mask_bn=padding_mask,
+                )
+                t2 = time.time()
+                display_step = batch_step + 1
+                print(
+                    "step {}/{} Batch encoding time: {:.3f}s, detection time: {:.3f}s".format(
+                        display_step,
+                        total_batches_est,
+                        t1 - t0,
+                        t2 - t1,
+                    )
+                )
+
+                target_hw = mask_preds.shape[-2:]
+                empty_masks = mask_preds.new_zeros((0, target_hw[0], target_hw[1]))
+                empty_scores = det_scores.new_zeros((0,))
+
+                if mask_preds.shape[1] == 0:
+                    for data_idx in idxs:
                         preencode_hw = prepared[data_idx]["preencode_hw"]
+                        gt_down_list = build_gt_down_list(
+                            prepared[data_idx]["gt_masks"],
+                            preencode_hw,
+                            target_hw,
+                            device,
+                        )
+                        merged_gt = merge_binary_masks(gt_down_list, target_hw, device)
+                        append_semantic_result(prepared[data_idx], merged_gt, empty_masks, empty_scores, batch_ious)
+                    continue
 
-                        scores = det_scores[local_idx]
-                        if scores.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
+                for local_idx, data_idx in enumerate(idxs):
+                    preencode_hw = prepared[data_idx]["preencode_hw"]
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        target_hw,
+                        device,
+                    )
+                    merged_gt = merge_binary_masks(gt_down_list, target_hw, device)
 
-                        boxes_nms, masks_nms, scores_nms = apply_mask_nms(
+                    scores = det_scores[local_idx]
+                    pred_masks_nhw = empty_masks
+                    pred_scores_n = empty_scores
+                    if scores.numel() > 0:
+                        _, masks_nms, scores_nms = apply_mask_nms(
                             box_preds[local_idx],
                             mask_preds[local_idx],
                             scores,
                             iou_threshold=args.nms_iou,
                         )
-                        if scores_nms.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
+                        pred_masks_nhw = masks_nms
+                        pred_scores_n = scores_nms
 
-                        gt_down_list = build_gt_down_list(
-                            prepared[data_idx]["gt_masks"],
-                            preencode_hw,
-                            mask_preds.shape[-2:],
-                            device,
-                        )
-
-                        pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
-                        update_pq_accumulators(
-                            pq_stats,
-                            pred_masks_list,
-                            gt_down_list,
-                            pred_scores=scores_nms,
-                            iou_threshold=pq_iou_threshold,
-                        )
-
-                        record = build_detection_record(
-                            prepared[data_idx]["object_id"],
-                            prepared[data_idx]["frame_id"],
-                            scores_nms,
-                            pred_masks_list,
-                            gt_down_list,
-                            iou_threshold=pq_iou_threshold,
-                            top_k=5,
-                        )
-                        detection_log.write(json.dumps(record) + "\n")
-
-                        best_iou = 0.0
-                        for gt_down in gt_down_list:
-                            iou = compute_mask_iou(masks_nms[0], gt_down)
-                            best_iou = max(best_iou, float(iou.item()))
-                        batch_ious.append(best_iou)
-                        total_iou_sum += best_iou
-                        total_iou_count += 1
-                        if best_iou > 0.5:
-                            batch_correct += 1
-                            total_correct_count += 1
-                        obj_id = prepared[data_idx]["object_id"]
-                        object_iou_sum[obj_id] += best_iou
-                        object_iou_count[obj_id] += 1
-
-                        if vis_target_idx is not None and data_idx == vis_target_idx:
-                            out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
-                            save_mask_triptych(
-                                prepared[data_idx]["image_bgr"],
-                                masks_nms,
-                                scores_nms,
-                                prepared[data_idx]["gt_masks"],
-                                object_id=prepared[data_idx]["object_id"],
-                                reference_dir=reference_dir,
-                                ref_view_ids=ref_view_ids,
-                                image_name=prepared[data_idx]["rgb_path"],
-                                output_path=out_path,
-                            )
-
-                if batch_ious:
-                    avg_iou = sum(batch_ious) / max(1, len(batch_ious))
-                    correct_rate = batch_correct / max(1, len(batch_ious))
-                    display_step = batch_step + 1
-                    print(
-                        f"step {display_step}/{total_batches_est} avg_iou={avg_iou:.4f} "
-                        f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
+                    top_masks, top_scores, _ = append_semantic_result(
+                        prepared[data_idx],
+                        merged_gt,
+                        pred_masks_nhw,
+                        pred_scores_n,
+                        batch_ious,
                     )
-                batch_step += 1
 
-                if args.max_batches > 0 and batch_step >= args.max_batches:
-                    break
+                    if vis_target_idx is not None and data_idx == vis_target_idx:
+                        merged_pred = merge_pred_masks_by_threshold(
+                            top_masks,
+                            top_scores,
+                            args.semantic_threshold,
+                        )
+                        out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
+                        save_mask_triptych(
+                            prepared[data_idx]["image_bgr"],
+                            top_masks,
+                            top_scores,
+                            prepared[data_idx]["gt_masks"],
+                            merged_pred,
+                            merged_gt,
+                            args.semantic_threshold,
+                            compute_mask_iou(merged_pred, merged_gt).item(),
+                            object_id=prepared[data_idx]["object_id"],
+                            reference_dir=reference_dir,
+                            ref_view_ids=ref_view_ids,
+                            image_name=prepared[data_idx]["rgb_path"],
+                            output_path=out_path,
+                        )
+
+            if batch_ious:
+                avg_iou = sum(batch_ious) / max(1, len(batch_ious))
+                display_step = batch_step + 1
+                print(
+                    f"step {display_step}/{total_batches_est} "
+                    f"miou@{args.semantic_threshold:.2f}={avg_iou:.4f} "
+                    f"samples={len(batch_ious)}"
+                )
+            batch_step += 1
+
+            if args.max_batches > 0 and batch_step >= args.max_batches:
+                break
 
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count
-        overall_correct = total_correct_count / total_iou_count
-        print(
-            f"overall_avg_iou={overall_avg:.4f} "
-            f"correct_rate={overall_correct:.3f} samples={total_iou_count}"
-        )
+        print(f"overall_miou@{args.semantic_threshold:.2f}={overall_avg:.4f} samples={total_iou_count}")
     if object_iou_count:
-        print("per_object_iou:")
+        print(f"per_object_miou@{args.semantic_threshold:.2f}:")
         for obj_id in sorted(object_iou_count.keys()):
             count = object_iou_count[obj_id]
             avg_iou = object_iou_sum[obj_id] / max(1, count)
-            print(f"  {obj_id}: avg_iou={avg_iou:.4f} samples={count}")
-    for score_threshold in sorted(pq_stats.keys()):
-        stats = pq_stats[score_threshold]
-        denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
-        if denom > 0:
-            pq = stats["sum_iou"] / denom
-        else:
-            pq = 0.0
-        print(
-            f"PQ@score>={score_threshold:.2f}={pq:.4f} "
-            f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
-        )
+            print(f"  {obj_id}: miou={avg_iou:.4f} samples={count}")
+
+    if semantic_records:
+        print("semantic_threshold_sweep:")
+        sweep_results: List[Tuple[float, float]] = []
+        for score_threshold in sweep_thresholds:
+            mean_iou, _, _ = evaluate_semantic_records(semantic_records, score_threshold)
+            sweep_results.append((score_threshold, mean_iou))
+            print(f"  miou@{score_threshold:.2f}={mean_iou:.4f}")
+        best_threshold, best_miou = max(sweep_results, key=lambda item: item[1])
+        print(f"best_threshold={best_threshold:.2f} best_miou={best_miou:.4f}")
 
 
 if __name__ == "__main__":
